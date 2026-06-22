@@ -52,7 +52,16 @@ def enrich_lab_file(
         raise ValueError("Predictions CSV must contain an 'image' column.")
 
     lab["SampleCode"] = lab["ID"].apply(base_code_from_lab)
-    predictions["SampleCode"] = predictions["image"].apply(base_code_from_image)
+    if "sample_code_base" in predictions.columns:
+        predictions["SampleCode"] = predictions["sample_code_base"]
+
+        missing_code = predictions["SampleCode"].isna()
+
+        predictions.loc[missing_code, "SampleCode"] = (
+            predictions.loc[missing_code, "image"].apply(base_code_from_image)
+        )
+    else:
+        predictions["SampleCode"] = predictions["image"].apply(base_code_from_image)
 
     prediction_columns = [
         "SampleCode",
