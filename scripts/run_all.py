@@ -65,12 +65,6 @@ def main():
         help="Maximum accepted DeltaE2000 for Munsell match.",
     )
 
-    parser.add_argument(
-        "--use-ocr",
-        action="store_true",
-        help="Enable QR/EasyOCR code extraction from image. Slower.",
-    )
-
     args = parser.parse_args()
 
     run_image_pipeline(
@@ -80,7 +74,6 @@ def main():
         debug_dir=args.debug_dir,
         save_debug_masks=not args.no_debug_masks,
         deltae_threshold=args.deltae_threshold,
-        use_ocr=args.use_ocr,
     )
 
     enrich_lab_file(

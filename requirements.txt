@@ -6,3 +6,4 @@ colour-science
 openpyxl
 matplotlib 
 scipy
+Pillow

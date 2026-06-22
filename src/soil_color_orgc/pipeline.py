@@ -5,6 +5,7 @@ import pandas as pd
 from .munsell import load_munsell, find_best_munsell
 from .image_processing import extract_dominant_lab
 from .soc_estimation import estimate_soc
+from .code_extraction_light import extract_sample_code_from_filename_only
 
 
 def find_image_paths(samples_dir: str):
@@ -28,6 +29,7 @@ def safe_extract_sample_code(image_path: str):
     """
     try:
         return extract_sample_code_from_filename_only(image_path)
+
     except Exception as exc:
         return {
             "sample_code_full": None,
@@ -39,6 +41,29 @@ def safe_extract_sample_code(image_path: str):
             "filename_code_base": None,
             "code_conflict": False,
         }
+
+
+def make_error_row(image_name: str, error: Exception):
+    return {
+        "image": image_name,
+        "sample_code_full": None,
+        "sample_code_base": None,
+        "sample_code_source": None,
+        "sample_code_match_score": None,
+        "sample_code_matched_fragment": None,
+        "sample_code_error": None,
+        "filename_code_base": None,
+        "code_conflict": None,
+        "L": None,
+        "a": None,
+        "b": None,
+        "best_munsell": None,
+        "deltaE2000": None,
+        "SOC_est%": None,
+        "SOC_method": None,
+        "processing_status": "error",
+        "processing_error": str(error),
+    }
 
 
 def run_image_pipeline(
@@ -61,7 +86,7 @@ def run_image_pipeline(
     print(f"Found {len(image_paths)} images", flush=True)
 
     if not image_paths:
-        print(f"No images found in: {samples_dir}")
+        print(f"No images found in: {samples_dir}", flush=True)
         return []
 
     rows = []
@@ -72,6 +97,7 @@ def run_image_pipeline(
 
         try:
             print("  extracting dominant Lab...", flush=True)
+
             lab = extract_dominant_lab(
                 image_path,
                 save_debug_masks=save_debug_masks,
@@ -81,10 +107,11 @@ def run_image_pipeline(
                 trim_percent=trim_percent,
             )
 
-            print("  extracting sample code...", flush=True)
+            print("  extracting sample code from filename...", flush=True)
             code_info = safe_extract_sample_code(image_path)
 
             print("  matching Munsell...", flush=True)
+
             best_munsell, delta_e = find_best_munsell(
                 lab,
                 munsell_dict,
@@ -128,27 +155,7 @@ def run_image_pipeline(
 
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
-
-            rows.append({
-                "image": image_name,
-                "sample_code_full": None,
-                "sample_code_base": None,
-                "sample_code_source": None,
-                "sample_code_match_score": None,
-                "sample_code_matched_fragment": None,
-                "sample_code_error": None,
-                "filename_code_base": None,
-                "code_conflict": None,
-                "L": None,
-                "a": None,
-                "b": None,
-                "best_munsell": None,
-                "deltaE2000": None,
-                "SOC_est%": None,
-                "SOC_method": None,
-                "processing_status": "error",
-                "processing_error": str(exc),
-            })
+            rows.append(make_error_row(image_name, exc))
 
     output_dir = os.path.dirname(output_csv)
 

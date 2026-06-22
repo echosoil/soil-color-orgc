@@ -1,6 +1,7 @@
 import re
 import os
 import cv2
+from .image_io import read_image_bgr_color_managed
 
 try:
     import pytesseract
@@ -192,8 +193,9 @@ def extract_sample_code_with_source(image_path: str):
                                   "ocr_full" / "filename" / "none"
         }
     """
-    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
 
+    image_bgr = read_image_bgr_color_managed(image_path)
+    # image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image_bgr is not None:
         roi = crop_code_region(image_bgr)
 
