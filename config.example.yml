@@ -1,0 +1,12 @@
+samples_dir: data/samples
+munsell_csv: data/munsell/rit_munsell.csv
+results_csv: outputs/results.csv
+debug_dir: debug_masks
+lab_file: data/lab/test_stat_orgC.xlsx
+enriched_lab_file: outputs/test_stat_orgC_enriched.xlsx
+
+deltae_threshold: 8.0
+downscale_max: 800
+kmeans_clusters: 4
+trim_percent: 0.05
+save_debug_masks: true

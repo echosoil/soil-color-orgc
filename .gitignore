@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Runtime data
+data/samples/*
+data/lab/*
+outputs/*
+debug_masks/*
+
+# Keep folder structure
+!data/samples/.gitkeep
+!data/lab/.gitkeep
+!outputs/.gitkeep
+!debug_masks/.gitkeep
+
+# Local spreadsheets and generated CSV outputs
+*.xlsx
+*.xls
+*.csv
+
+# Allow Munsell reference CSV if license permits
+!data/munsell/rit_munsell.csv
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

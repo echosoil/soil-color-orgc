@@ -1,0 +1,9 @@
+opencv-python
+pandas
+numpy
+scikit-learn
+colour-science
+openpyxl
+matplotlib 
+scipy
+pytesseract
