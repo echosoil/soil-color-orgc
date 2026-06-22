@@ -1,163 +1,261 @@
 import os
 import cv2
 import numpy as np
-from sklearn.cluster import KMeans
 from colour import sRGB_to_XYZ, XYZ_to_Lab
 
 
-def downscale_max_side(img_bgr, max_side: int = 800):
-    h, w = img_bgr.shape[:2]
-    max_current_side = max(h, w)
-
-    if max_current_side <= max_side:
-        return img_bgr
-
-    scale = max_side / float(max_current_side)
-
-    return cv2.resize(
-        img_bgr,
-        (int(w * scale), int(h * scale)),
-        interpolation=cv2.INTER_AREA,
-    )
-
-
-def bilateral_denoise(img_bgr):
-    return cv2.bilateralFilter(
-        img_bgr,
-        d=7,
-        sigmaColor=50,
-        sigmaSpace=50,
-    )
-
-
-def build_soil_mask(img_bgr):
+def ensure_portrait_orientation(image_bgr):
     """
-    Conservative soil mask.
+    Ensure image is portrait.
 
-    It rejects:
-    - strong highlights,
-    - deep shadows,
-    - very desaturated background/card/paper regions.
+    In our dataset, valid sample images should have:
+        height > width
+
+    If width > height, rotate 90 degrees.
+
+    Note:
+        This does not 'swap x and y' mathematically.
+        It rotates the image so that x remains width and y remains height.
     """
-    img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    _, saturation, value = cv2.split(img_hsv)
+    height, width = image_bgr.shape[:2]
 
-    mask_value = (value > 25) & (value < 230)
-    mask_saturation = saturation > 25
-    base_mask = (mask_value & mask_saturation).astype(np.uint8)
+    if width > height:
+        image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
 
-    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    _, a_channel, b_channel = cv2.split(img_lab)
-
-    dist_ab = np.sqrt(
-        (a_channel.astype(np.int16) - 128) ** 2
-        + (b_channel.astype(np.int16) - 128) ** 2
-    )
-
-    mask_ab = dist_ab > 6
-    mask = (base_mask & mask_ab).astype(np.uint8) * 255
-
-    kernel = np.ones((5, 5), np.uint8)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    return mask
+    return image_bgr
 
 
-def save_debug_mask(img_bgr, mask, out_path):
+def downscale_max_side(image_bgr, max_side=1200):
     """
-    Save a PNG debug overlay, regardless of original image extension.
+    Downscale large images for faster processing.
+    Keeps aspect ratio.
     """
-    base = os.path.splitext(os.path.basename(out_path))[0]
-    out_png = os.path.join(os.path.dirname(out_path), f"{base}_mask.png")
+    h, w = image_bgr.shape[:2]
+    current_max = max(h, w)
 
-    debug_img = img_bgr.copy()
+    if current_max <= max_side:
+        return image_bgr
 
-    green = np.zeros_like(debug_img)
-    green[:, :, 1] = 255
+    scale = max_side / current_max
+    new_w = int(w * scale)
+    new_h = int(h * scale)
 
-    overlay = cv2.addWeighted(debug_img, 0.8, green, 0.4, 0)
-    debug_img[mask > 0] = overlay[mask > 0]
+    return cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    cv2.imwrite(out_png, debug_img)
+
+def crop_central_soil_roi(
+    image_bgr,
+    x_min=0.10,
+    x_max=0.90,
+    y_min=0.10,
+    y_max=0.90,
+):
+    """
+    Fixed central crop.
+
+    Default:
+        x: 40% to 60%
+        y: 50% to 70%
+
+    This intentionally ignores most borders, labels and background.
+    """
+    h, w = image_bgr.shape[:2]
+
+    x1 = int(w * x_min)
+    x2 = int(w * x_max)
+    y1 = int(h * y_min)
+    y2 = int(h * y_max)
+
+    roi = image_bgr[y1:y2, x1:x2].copy()
+
+    return roi, (x1, y1, x2, y2)
+
+
+def build_simple_roi_mask(
+    roi_bgr,
+    min_v=30,
+    max_v=240,
+    white_v=205,
+    white_s=35,
+):
+    """
+    Simple mask inside the fixed ROI.
+
+    Goal:
+        remove obvious white paper/background and very dark shadow holes.
+
+    This is intentionally loose. We are not trying to perfectly segment soil.
+    """
+    smoothed = cv2.GaussianBlur(roi_bgr, (5, 5), 0)
+    hsv = cv2.cvtColor(smoothed, cv2.COLOR_BGR2HSV)
+
+    h, s, v = cv2.split(hsv)
+
+    not_too_dark = v > min_v
+    not_too_bright = v < max_v
+
+    # White paper tends to be bright and low-saturation.
+    not_white_paper = ~((v > white_v) & (s < white_s))
+
+    mask = not_too_dark & not_too_bright & not_white_paper
+
+    mask_u8 = mask.astype(np.uint8) * 255
+
+    # Small cleanup, but not too aggressive because soil is naturally grainy.
+    kernel = np.ones((3, 3), np.uint8)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+
+    return mask_u8
+
+
+def bgr_pixels_to_lab(pixels_bgr):
+    """
+    Convert BGR uint8 pixels to CIE Lab using colour-science.
+
+    This keeps the Lab calculation consistent with the Munsell conversion.
+    """
+    pixels_rgb = pixels_bgr[:, ::-1].astype(np.float32) / 255.0
+
+    xyz = sRGB_to_XYZ(pixels_rgb)
+    lab = XYZ_to_Lab(xyz)
+
+    return lab
+
+
+def trim_lab_by_lightness(lab_pixels, trim_percent=0.08):
+    """
+    Remove darkest and brightest pixels by L.
+
+    This reduces influence of:
+        - dark shadow crevices between grains
+        - bright highlights / paper leakage
+    """
+    if lab_pixels.shape[0] < 50:
+        return lab_pixels
+
+    L = lab_pixels[:, 0]
+
+    low = np.quantile(L, trim_percent)
+    high = np.quantile(L, 1.0 - trim_percent)
+
+    keep = (L >= low) & (L <= high)
+
+    trimmed = lab_pixels[keep]
+
+    if trimmed.shape[0] < 50:
+        return lab_pixels
+
+    return trimmed
+
+
+def save_debug_images(
+    image_bgr,
+    roi_bgr,
+    mask_u8,
+    rect,
+    image_path,
+    debug_dir,
+):
+    """
+    Save visual diagnostics:
+        *_roi_rect.jpg   original image with selected ROI
+        *_roi.jpg        selected ROI
+        *_roi_mask.png   mask used inside ROI
+        *_roi_used.jpg   ROI with rejected pixels marked red
+    """
+    os.makedirs(debug_dir, exist_ok=True)
+
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+
+    x1, y1, x2, y2 = rect
+
+    marked = image_bgr.copy()
+    cv2.rectangle(marked, (x1, y1), (x2, y2), (0, 255, 0), 4)
+
+    used = roi_bgr.copy()
+    used[mask_u8 == 0] = (0, 0, 255)
+
+    cv2.imwrite(os.path.join(debug_dir, f"{stem}_roi_rect.jpg"), marked)
+    cv2.imwrite(os.path.join(debug_dir, f"{stem}_roi.jpg"), roi_bgr)
+    cv2.imwrite(os.path.join(debug_dir, f"{stem}_roi_mask.png"), mask_u8)
+    cv2.imwrite(os.path.join(debug_dir, f"{stem}_roi_used.jpg"), used)
 
 
 def extract_dominant_lab(
     image_path: str,
     save_debug_masks: bool = True,
     debug_dir: str = "debug_masks",
-    downscale_max: int = 800,
+    downscale_max: int = 1200,
     kmeans_clusters: int = 4,
-    trim_percent: float = 0.05,
+    trim_percent: float = 0.08,
 ):
     """
-    Extract robust dominant soil color in CIE Lab.
+    Extract representative soil color from a fixed central ROI.
 
-    Returns:
-        (L, a, b)
+    This version deliberately does NOT use KMeans.
+
+    Current strategy:
+        1. Read image with OpenCV.
+        2. Downscale if large.
+        3. Crop central ROI: x 35-65%, y 25-55%.
+        4. Build loose mask inside ROI.
+        5. Blur ROI to reduce grain-level noise.
+        6. Convert selected pixels to Lab.
+        7. Trim darkest/brightest pixels.
+        8. Return median Lab.
+
+    kmeans_clusters is kept in the function signature only so pipeline.py
+    does not need to change.
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
 
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+    if image_bgr is None:
+        raise ValueError(f"Could not read image: {image_path}")
 
-    img = downscale_max_side(img, downscale_max)
-    img = bilateral_denoise(img)
+    image_bgr = ensure_portrait_orientation(image_bgr)
+    image_bgr = downscale_max_side(image_bgr, max_side=downscale_max)
 
-    mask = build_soil_mask(img)
+    roi_bgr, rect = crop_central_soil_roi(
+        image_bgr,
+        x_min=0.40,
+        x_max=0.60,
+        y_min=0.50,
+        y_max=0.70,
+    )
+
+    if roi_bgr.size == 0:
+        raise ValueError(f"Empty ROI for image: {image_path}")
+
+    mask_u8 = build_simple_roi_mask(roi_bgr)
 
     if save_debug_masks:
-        os.makedirs(debug_dir, exist_ok=True)
-        save_debug_mask(
-            img,
-            mask,
-            os.path.join(debug_dir, os.path.basename(image_path)),
+        save_debug_images(
+            image_bgr=image_bgr,
+            roi_bgr=roi_bgr,
+            mask_u8=mask_u8,
+            rect=rect,
+            image_path=image_path,
+            debug_dir=debug_dir,
         )
 
-    if mask.sum() == 0:
-        roi_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).reshape(-1, 3)
-    else:
-        roi = cv2.bitwise_and(img, img, mask=mask)
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        roi_rgb = roi_rgb[mask > 0]
+    # Blur for color extraction, not for saving the visible ROI.
+    # This reduces the effect of grain micro-shadows.
+    roi_blur = cv2.GaussianBlur(roi_bgr, (9, 9), 0)
 
-    if len(roi_rgb) < 100:
-        rgb_selected = roi_rgb
-    else:
-        lows = np.quantile(roi_rgb, trim_percent, axis=0)
-        highs = np.quantile(roi_rgb, 1 - trim_percent, axis=0)
+    selected_pixels = roi_blur[mask_u8 > 0]
 
-        keep = np.all((roi_rgb >= lows) & (roi_rgb <= highs), axis=1)
-        rgb_selected = roi_rgb[keep]
+    # If the mask becomes too restrictive, fall back to the full ROI.
+    if selected_pixels.shape[0] < 500:
+        selected_pixels = roi_blur.reshape(-1, 3)
 
-    if rgb_selected.shape[0] > 50000:
-        idx = np.random.choice(rgb_selected.shape[0], 50000, replace=False)
-        rgb_selected = rgb_selected[idx]
+    lab_pixels = bgr_pixels_to_lab(selected_pixels)
 
-    rgb_norm = rgb_selected.astype(np.float32) / 255.0
+    lab_pixels = trim_lab_by_lightness(
+        lab_pixels,
+        trim_percent=trim_percent,
+    )
 
-    XYZ = np.apply_along_axis(sRGB_to_XYZ, 1, rgb_norm)
-    Lab = np.apply_along_axis(XYZ_to_Lab, 1, XYZ)
+    lab_median = np.median(lab_pixels, axis=0)
 
-    lab_median = np.median(Lab, axis=0)
-
-    try:
-        kmeans = KMeans(
-            n_clusters=kmeans_clusters,
-            random_state=42,
-            n_init=5,
-        ).fit(rgb_selected)
-
-        labels, counts = np.unique(kmeans.labels_, return_counts=True)
-        dominant_cluster = labels[np.argmax(counts)]
-
-        dominant_rgb = kmeans.cluster_centers_[dominant_cluster] / 255.0
-        dominant_lab = XYZ_to_Lab(sRGB_to_XYZ(dominant_rgb))
-
-        final_lab = 0.5 * lab_median + 0.5 * np.array(dominant_lab)
-
-    except Exception:
-        final_lab = lab_median
-
-    return tuple(map(float, final_lab))
+    return tuple(float(x) for x in lab_median)
