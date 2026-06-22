@@ -21,47 +21,13 @@ def find_image_paths(samples_dir: str):
     return sorted(set(image_paths))
 
 
-def safe_extract_sample_code(image_path: str, use_ocr: bool = False, known_codes=None):
+def safe_extract_sample_code(image_path: str):
     """
-    Extract sample code, but never let OCR/QR problems stop the pipeline.
-
-    Important:
-    - If use_ocr=False, this only uses the filename.
-    - If use_ocr=True, it imports EasyOCR code lazily.
+    Fast filename-only sample code extraction.
+    No OCR, no QR recognition.
     """
     try:
-        if use_ocr:
-            from .code_extraction import extract_sample_code_with_source
-            return extract_sample_code_with_source(image_path, known_codes=known_codes)
-
-        # Fast filename-only fallback.
-        from .code_extraction_light import extract_code_from_filename
-
-        filename_base = extract_code_from_filename(image_path)
-
-        if filename_base:
-            return {
-                "sample_code_full": None,
-                "sample_code_base": filename_base,
-                "sample_code_source": "filename",
-                "sample_code_match_score": None,
-                "sample_code_matched_fragment": filename_base,
-                "sample_code_error": None,
-                "filename_code_base": filename_base,
-                "code_conflict": False,
-            }
-
-        return {
-            "sample_code_full": None,
-            "sample_code_base": None,
-            "sample_code_source": "none",
-            "sample_code_match_score": None,
-            "sample_code_matched_fragment": None,
-            "sample_code_error": None,
-            "filename_code_base": None,
-            "code_conflict": False,
-        }
-
+        return extract_sample_code_from_filename_only(image_path)
     except Exception as exc:
         return {
             "sample_code_full": None,
@@ -85,8 +51,6 @@ def run_image_pipeline(
     downscale_max: int = 800,
     kmeans_clusters: int = 4,
     trim_percent: float = 0.05,
-    use_ocr: bool = False,
-    known_codes=None,
 ):
     print("Loading Munsell table...", flush=True)
     munsell_dict = load_munsell(munsell_csv)
@@ -118,11 +82,7 @@ def run_image_pipeline(
             )
 
             print("  extracting sample code...", flush=True)
-            code_info = safe_extract_sample_code(
-                image_path,
-                use_ocr=use_ocr,
-                known_codes=known_codes,
-            )
+            code_info = safe_extract_sample_code(image_path)
 
             print("  matching Munsell...", flush=True)
             best_munsell, delta_e = find_best_munsell(
@@ -157,10 +117,10 @@ def run_image_pipeline(
             rows.append(row)
 
             print(
-                f"  OK → {best_munsell} "
-                f"(ΔE2000={round(float(delta_e), 2)}) "
+                f"  OK -> {best_munsell} "
+                f"(DeltaE2000={round(float(delta_e), 2)}) "
                 f"LAB={tuple(round(x, 1) for x in lab)} "
-                f"SOC_est%={round(float(soc), 2)} [{soc_method}] "
+                f"SOC_est={round(float(soc), 2)}% [{soc_method}] "
                 f"code={code_info.get('sample_code_base')} "
                 f"[{code_info.get('sample_code_source')}]",
                 flush=True,
