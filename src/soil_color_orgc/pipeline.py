@@ -5,7 +5,7 @@ import pandas as pd
 from .munsell import load_munsell, find_best_munsell
 from .image_processing import extract_dominant_lab
 from .soc_estimation import estimate_soc
-from .code_extraction import extract_sample_code, base_code_from_sample_code
+from .code_extraction import base_code_from_sample_code, extract_sample_code_with_source
 
 def find_image_paths(samples_dir: str):
     patterns = [
@@ -55,9 +55,12 @@ def run_image_pipeline(
                 trim_percent=trim_percent,
             )
 
-            sample_code_full = extract_sample_code(image_path)
-            sample_code_base = base_code_from_sample_code(sample_code_full)
+            sample_code_data = extract_sample_code_with_source(image_path)
+            sample_code_full = sample_code_data["sample_code_full"]
+            sample_code_base = sample_code_data["sample_code_base"]
 
+            code_info = extract_sample_code_with_source(image_path)
+            
             best_munsell, delta_e = find_best_munsell(
                 lab,
                 munsell_dict,
@@ -68,8 +71,9 @@ def run_image_pipeline(
 
             row = {
                 "image": os.path.basename(image_path),
-                "sample_code_full": sample_code_full,
-                "sample_code_base": sample_code_base,
+                "sample_code_full": code_info["sample_code_full"],
+                "sample_code_base": code_info["sample_code_base"],
+                "sample_code_source": code_info["sample_code_source"],
                 "L": round(lab[0], 3),
                 "a": round(lab[1], 3),
                 "b": round(lab[2], 3),
@@ -85,7 +89,8 @@ def run_image_pipeline(
                 f"{image_path} → {best_munsell} "
                 f"(ΔE2000={round(float(delta_e), 2)}) "
                 f"LAB={tuple(round(x, 1) for x in lab)} "
-                f"SOC_est%={round(float(soc), 2)} [{soc_method}]"
+                f"SOC_est%={round(float(soc), 2)} [{soc_method}] "
+                f"code={code_info['sample_code_base']} [{code_info['sample_code_source']}]"
             )
 
         except Exception as exc:

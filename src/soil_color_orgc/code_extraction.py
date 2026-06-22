@@ -1,6 +1,6 @@
 import re
+import os
 import cv2
-import numpy as np
 
 try:
     import pytesseract
@@ -9,17 +9,23 @@ except ImportError:
 
 
 CODE_PATTERN = re.compile(r"\b[A-Z]{4}-\d{4}\b")
+FILENAME_CODE_PATTERN = re.compile(r"\b([A-Z]{4})(?:-\d{4})?\b", re.IGNORECASE)
 
 
 def find_code_in_text(text: str):
     """
-    Find sample code like BMXU-2646 in arbitrary text.
+    Find full sample code like BMXU-2646 in arbitrary text.
     """
     if not text:
         return None
 
     text = text.upper()
-    text = text.replace("—", "-").replace("–", "-").replace("_", "-")
+    text = (
+        text.replace("—", "-")
+        .replace("–", "-")
+        .replace("_", "-")
+        .replace(" ", "")
+    )
 
     match = CODE_PATTERN.search(text)
 
@@ -29,13 +35,41 @@ def find_code_in_text(text: str):
     return None
 
 
+def base_code_from_sample_code(code: str):
+    """
+    BMXU-2646 -> BMXU
+    """
+    if not code:
+        return None
+
+    return code.split("-")[0].upper()
+
+
+def extract_code_from_filename(image_path: str):
+    """
+    Extract code from image filename.
+
+    Examples:
+        APKC.jfif      -> APKC
+        APKC-1234.jpg  -> APKC
+    """
+    filename = os.path.basename(image_path)
+    stem = os.path.splitext(filename)[0]
+
+    match = FILENAME_CODE_PATTERN.search(stem)
+
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
 def extract_code_from_qr(image_bgr):
     """
     Try to decode QR code using OpenCV.
-    Returns code like BMXU-2646 or None.
+    Returns full code like BMXU-2646 or None.
     """
     detector = cv2.QRCodeDetector()
-
     data, points, _ = detector.detectAndDecode(image_bgr)
 
     if data:
@@ -45,12 +79,8 @@ def extract_code_from_qr(image_bgr):
 
 
 def preprocess_for_ocr(image_bgr):
-    """
-    Prepare image for OCR.
-    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Upscale: OCR works better on larger text
     gray = cv2.resize(
         gray,
         None,
@@ -59,10 +89,8 @@ def preprocess_for_ocr(image_bgr):
         interpolation=cv2.INTER_CUBIC,
     )
 
-    # Reduce noise
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Threshold
     _, thresh = cv2.threshold(
         gray,
         0,
@@ -75,7 +103,8 @@ def preprocess_for_ocr(image_bgr):
 
 def extract_code_from_ocr(image_bgr):
     """
-    Use Tesseract OCR to detect text and extract ABCD-1234-style code.
+    Use Tesseract OCR to detect printed text.
+    Returns full code like BMXU-2646 or None.
     """
     if pytesseract is None:
         return None
@@ -98,40 +127,54 @@ def extract_code_from_ocr(image_bgr):
     return None
 
 
-def extract_sample_code(image_path: str):
+def extract_sample_code_with_source(image_path: str):
     """
-    Extract sample code from an image.
+    Extract sample code and record how it was found.
 
-    Strategy:
-    1. Try QR code.
-    2. Try OCR text recognition.
+    Priority:
+        1. QR code in image
+        2. OCR text in image
+        3. Filename
 
     Returns:
-        "BMXU-2646" or None
+        {
+            "sample_code_full": "BMXU-2646" or None,
+            "sample_code_base": "BMXU" or None,
+            "sample_code_source": "qr" / "ocr" / "filename" / "none"
+        }
     """
     image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
 
-    if image_bgr is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
+    if image_bgr is not None:
+        qr_code = extract_code_from_qr(image_bgr)
 
-    code = extract_code_from_qr(image_bgr)
+        if qr_code:
+            return {
+                "sample_code_full": qr_code,
+                "sample_code_base": base_code_from_sample_code(qr_code),
+                "sample_code_source": "qr",
+            }
 
-    if code:
-        return code
+        ocr_code = extract_code_from_ocr(image_bgr)
 
-    code = extract_code_from_ocr(image_bgr)
+        if ocr_code:
+            return {
+                "sample_code_full": ocr_code,
+                "sample_code_base": base_code_from_sample_code(ocr_code),
+                "sample_code_source": "ocr",
+            }
 
-    if code:
-        return code
+    filename_code = extract_code_from_filename(image_path)
 
-    return None
+    if filename_code:
+        return {
+            "sample_code_full": None,
+            "sample_code_base": filename_code,
+            "sample_code_source": "filename",
+        }
 
-
-def base_code_from_sample_code(code: str):
-    """
-    BMXU-2646 -> BMXU
-    """
-    if not code:
-        return None
-
-    return code.split("-")[0].upper()
+    return {
+        "sample_code_full": None,
+        "sample_code_base": None,
+        "sample_code_source": "none",
+    }
