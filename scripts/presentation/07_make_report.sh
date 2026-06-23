@@ -1,5 +1,8 @@
 #!/bin/bash
 # Must be run from the root of the repository
+# Remember first to chmod +x scripts/presentation/*  
+
+./scripts/presentation/00_*
 ./scripts/presentation/01_*
 ./scripts/presentation/02_*
 ./scripts/presentation/03_*
