@@ -1,3 +1,0 @@
-FROM nginx:alpine
-COPY outputs/presentation_report /usr/share/nginx/html
-EXPOSE 80
