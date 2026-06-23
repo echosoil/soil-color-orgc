@@ -13,4 +13,5 @@ python3 scripts/make_presentation_report.py \
   --with-gray outputs/test_stat_orgC_enriched_with_gray.xlsx \
   --out outputs/presentation_report
 
-python3 -m http.server 8088 --directory outputs/presentation_report
+# optional: start a local web server to view the report
+# python3 -m http.server 8088 --directory outputs/presentation_report
