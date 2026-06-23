@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+""" Example usage:
+# --------------
+ python3 scripts/train_calibration_models.py \
+  --input outputs/test_stat_orgC_enriched.xlsx \
+  --target orgC_lab \
+  --test-size 19 \
+  --seed 42
+"""
 
 import argparse
 import os

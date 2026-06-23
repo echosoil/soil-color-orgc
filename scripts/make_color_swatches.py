@@ -35,26 +35,68 @@ def make_swatch(rgb_u8, size=220):
     return swatch
 
 
+def format_munsell_notation(h, v, c):
+    """
+    Create notation like:
+        10YR 3/4
+
+    Avoids accidental 3.0/4.0 formatting.
+    """
+    def clean_number(x):
+        x = float(x)
+        if x.is_integer():
+            return str(int(x))
+        return str(x).rstrip("0").rstrip(".")
+
+    return f"{str(h).strip()} {clean_number(v)}/{clean_number(c)}"
+
+
 def load_munsell_rgb_lookup(munsell_csv):
     """
     Build mapping:
         notation -> (R, G, B)
-    using the integer R,G,B columns from the CSV.
+
+    RIT Munsell CSV may contain:
+        R,G,B      as normalized 0..1 floats
+        dR,dG,dB   as 8-bit display RGB values
+
+    For visualization, prefer dR,dG,dB when available.
     """
     df = pd.read_csv(munsell_csv)
-    df["notation"] = (
-        df["h"].astype(str) + " " + df["V"].astype(str) + "/" + df["C"].astype(str)
-    )
 
     lookup = {}
 
     for _, row in df.iterrows():
-        notation = row["notation"]
-        lookup[notation] = (
-            int(row["R"]),
-            int(row["G"]),
-            int(row["B"]),
-        )
+        notation = format_munsell_notation(row["h"], row["V"], row["C"])
+
+        if {"dR", "dG", "dB"}.issubset(df.columns):
+            rgb = (
+                int(round(row["dR"])),
+                int(round(row["dG"])),
+                int(round(row["dB"])),
+            )
+        else:
+            r = float(row["R"])
+            g = float(row["G"])
+            b = float(row["B"])
+
+            # If RGB is normalized 0..1, scale to 0..255.
+            if max(r, g, b) <= 1.0:
+                rgb = (
+                    int(round(r * 255)),
+                    int(round(g * 255)),
+                    int(round(b * 255)),
+                )
+            else:
+                rgb = (
+                    int(round(r)),
+                    int(round(g)),
+                    int(round(b)),
+                )
+
+        rgb = tuple(max(0, min(255, x)) for x in rgb)
+
+        lookup[notation] = rgb
 
     return lookup
 
