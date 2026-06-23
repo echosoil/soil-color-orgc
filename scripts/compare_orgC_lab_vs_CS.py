@@ -8,7 +8,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.linear_model import LinearRegression
 
 
-INPUT_XLSX = "data/lab/test_stat_orgC_enriched.xlsx"
+INPUT_XLSX = "outputs/test_stat_orgC_enriched_with_gray.xlsx"
 OUTPUT_DIR = "outputs/orgC_comparison_outputs"
 
 LAB_COL = "orgC_lab"

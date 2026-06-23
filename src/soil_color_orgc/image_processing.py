@@ -74,35 +74,44 @@ def crop_central_soil_roi(
 
 def build_simple_roi_mask(
     roi_bgr,
-    min_v=30,
-    max_v=240,
-    white_v=205,
-    white_s=35,
+    min_v=20,
+    max_v=245,
+    white_v=190,
+    white_s=70,
+    white_min_rgb=180,
+    white_spread=45,
 ):
     """
     Simple mask inside the fixed ROI.
 
     Goal:
-        remove obvious white paper/background and very dark shadow holes.
+        keep soil-like pixels,
+        remove white/pale paper and very dark shadow holes.
 
-    This is intentionally loose. We are not trying to perfectly segment soil.
+    This version is stricter against paper than the previous one.
     """
     smoothed = cv2.GaussianBlur(roi_bgr, (5, 5), 0)
     hsv = cv2.cvtColor(smoothed, cv2.COLOR_BGR2HSV)
 
-    h, s, v = cv2.split(hsv)
+    _, s, v = cv2.split(hsv)
+
+    rgb = cv2.cvtColor(smoothed, cv2.COLOR_BGR2RGB).astype(np.float32)
+    rgb_min = np.min(rgb, axis=2)
+    rgb_max = np.max(rgb, axis=2)
+    rgb_spread = rgb_max - rgb_min
 
     not_too_dark = v > min_v
     not_too_bright = v < max_v
 
-    # White paper tends to be bright and low-saturation.
-    not_white_paper = ~((v > white_v) & (s < white_s))
+    white_like = (
+        ((v > white_v) & (s < white_s))
+        | ((rgb_min > white_min_rgb) & (rgb_spread < white_spread))
+    )
 
-    mask = not_too_dark & not_too_bright & not_white_paper
+    mask = not_too_dark & not_too_bright & (~white_like)
 
     mask_u8 = mask.astype(np.uint8) * 255
 
-    # Small cleanup, but not too aggressive because soil is naturally grainy.
     kernel = np.ones((3, 3), np.uint8)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
@@ -183,6 +192,95 @@ def save_debug_images(
     cv2.imwrite(os.path.join(debug_dir, f"{stem}_roi_used.jpg"), used)
 
 
+def trim_soil_roi_to_nonwhite_content(
+    roi_bgr,
+    rect,
+    min_v=20,
+    white_v=190,
+    white_s=70,
+    white_min_rgb=180,
+    white_spread=45,
+    min_row_fraction=0.35,
+    min_col_fraction=0.20,
+    pad_fraction=0.04,
+):
+    """
+    Trim a soil ROI to remove white/pale paper strips.
+
+    This is useful when the fixed crop includes part of the filter paper
+    or tray edge. It trims rows/columns that are mostly white-like.
+
+    Returns:
+        trimmed_roi_bgr, trimmed_rect
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return roi_bgr, rect
+
+    h, w = roi_bgr.shape[:2]
+
+    if h < 20 or w < 20:
+        return roi_bgr, rect
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+
+    rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    rgb_min = np.min(rgb, axis=2)
+    rgb_max = np.max(rgb, axis=2)
+    rgb_spread = rgb_max - rgb_min
+
+    # White / pale paper:
+    #   - high brightness and low saturation
+    #   - or all RGB channels high and close together
+    white_like = (
+        ((v > white_v) & (s < white_s))
+        | ((rgb_min > white_min_rgb) & (rgb_spread < white_spread))
+    )
+
+    # Candidate soil-like pixels are not white-like and not extremely dark.
+    soil_like = (~white_like) & (v > min_v)
+
+    row_fraction = soil_like.mean(axis=1)
+    col_fraction = soil_like.mean(axis=0)
+
+    good_rows = np.where(row_fraction >= min_row_fraction)[0]
+    good_cols = np.where(col_fraction >= min_col_fraction)[0]
+
+    if len(good_rows) == 0 or len(good_cols) == 0:
+        return roi_bgr, rect
+
+    y1_local = int(good_rows[0])
+    y2_local = int(good_rows[-1]) + 1
+
+    x1_local = int(good_cols[0])
+    x2_local = int(good_cols[-1]) + 1
+
+    pad_y = int((y2_local - y1_local) * pad_fraction)
+    pad_x = int((x2_local - x1_local) * pad_fraction)
+
+    y1_local = max(0, y1_local - pad_y)
+    y2_local = min(h, y2_local + pad_y)
+
+    x1_local = max(0, x1_local - pad_x)
+    x2_local = min(w, x2_local + pad_x)
+
+    if y2_local <= y1_local or x2_local <= x1_local:
+        return roi_bgr, rect
+
+    trimmed_roi = roi_bgr[y1_local:y2_local, x1_local:x2_local].copy()
+
+    x1, y1, x2, y2 = rect
+
+    trimmed_rect = (
+        x1 + x1_local,
+        y1 + y1_local,
+        x1 + x2_local,
+        y1 + y2_local,
+    )
+
+    return trimmed_roi, trimmed_rect
+
+
 def extract_dominant_lab(
     image_path: str,
     save_debug_masks: bool = True,
@@ -243,6 +341,11 @@ def extract_dominant_lab(
         y_max=0.70,
     )
 
+    roi_bgr, rect = trim_soil_roi_to_nonwhite_content(
+        roi_bgr,
+        rect,
+    )
+
     if roi_bgr.size == 0:
         raise ValueError(f"Empty ROI for image: {image_path}")
 
@@ -277,4 +380,11 @@ def extract_dominant_lab(
 
     lab_median = np.median(lab_pixels, axis=0)
 
+    if lab_median[0] > 75:
+        print(
+            f"  WARNING: very bright estimated soil color for {image_name}: "
+            f"L={lab_median[0]:.2f}. Check ROI/mask.",
+            flush=True,
+        )
+        
     return tuple(float(x) for x in lab_median)
