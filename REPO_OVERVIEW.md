@@ -1,6 +1,6 @@
 # Repository Overview
 
-Generated: `2026-06-23 02:21:07`
+Generated: `2026-06-23 08:38:01`
 
 This file is generated automatically by:
 
@@ -18,11 +18,13 @@ soil-color-orgc/
 │   └── munsell
 │       └── rit_munsell.csv
 ├── scripts
+│   ├── __pycache__
 │   ├── compare_orgC_lab_vs_CS.py
 │   ├── create_repo_overview.py
 │   ├── diagnose_color_profile.py
 │   ├── enrich_lab_file.py
 │   ├── make_color_swatches.py
+│   ├── make_presentation_report.py
 │   ├── run_all.py
 │   └── run_color_estimation.py
 ├── src
@@ -41,8 +43,11 @@ soil-color-orgc/
 │       └── train_calibration_models.py
 ├── .gitignore
 ├── config.example.yml
+├── Dockerfile.report
 ├── LICENSE
+├── make_presentation_report_README.md
 ├── README.md
+├── REPO_OVERVIEW.md
 └── requirements.txt
 ```
 
@@ -173,6 +178,52 @@ Functions:
 - `make_labeled_panel(content_bgr, title, width, height)`
 - `load_roi_image(debug_dir, image_name)`
 - `build_comparison_card(row, munsell_rgb_lookup, debug_dir, out_dir)`
+- `main()`
+
+### `scripts/make_presentation_report.py`
+
+Generate an automated static HTML report comparing:
+
+Imports:
+
+```text
+__future__, argparse, dataclasses, html, math, matplotlib, matplotlib.pyplot, numpy, pandas, pathlib, re, scipy, sklearn.linear_model, sklearn.metrics, sklearn.model_selection, sklearn.pipeline, sklearn.preprocessing, sys, typing
+```
+
+Classes:
+
+- `ComparisonResult`
+
+Functions:
+
+- `fmt(value, digits)` — Format a numeric value for display.
+- `fmt_p(value)` — Format a p-value for display.
+- `slugify(text)`
+- `read_table(path, preferred_sheet)` — Read CSV/XLS/XLSX, preferring a sheet named 'enriched' when present.
+- `normalize_columns(df)`
+- `filter_processing_ok(df)` — Keep successful rows when a processing_status column exists.
+- `clean_pair_df(df, y_true_col, y_pred_col, extra_cols)` — Keep identifier columns and rows with valid numeric true/predicted values.
+- `compute_ccc(y_true, y_pred)` — Lin's concordance correlation coefficient.
+- `compute_metrics(y_true, y_pred)`
+- `choose_cv(n)`
+- `train_cv_predictions(df, target_col, feature_cols, prediction_col)` — Train a simple calibrated model and return cross-validated predictions.
+- `make_scatter_plot(df, y_true_col, y_pred_col, title, subtitle, output_path, metrics)`
+- `make_bland_altman_plot(df, y_true_col, y_pred_col, title, output_path, metrics)`
+- `make_residual_plot(df, y_true_col, y_pred_col, title, output_path)`
+- `make_metrics_bar_plot(summary_df, output_path)`
+- `create_figures(result, figures_dir)`
+- `interpret_metrics(metrics, mode)`
+- `build_citizen_comparison(lab_df, lab_col, citizen_col)`
+- `build_no_gray_trained_comparison(no_gray_df, lab_col, feature_cols)`
+- `build_with_gray_direct_comparison(with_gray_df, lab_col, estimate_col)`
+- `metrics_to_summary_row(result)`
+- `relative_figure_path(path, out_dir)`
+- `html_metric_table(summary_df)`
+- `html_model_info(model_info)`
+- `render_html_report(results, summary_df, out_dir, model_info, title)`
+- `write_predictions(result, out_dir)`
+- `run_report(args)`
+- `parse_args()`
 - `main()`
 
 ### `scripts/run_all.py`
