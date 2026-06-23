@@ -23,6 +23,7 @@ import argparse
 import html
 import math
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,473 @@ def slugify(text: str) -> str:
     text = text.strip("_")
     return text or "section"
 
+def extract_sample_code(value) -> str | None:
+    """
+    Extract a four-letter sample code from ID, SampleCode, sample_code_base, or image name.
+
+    Examples:
+        APKC
+        APKC-1234
+        APKC.jfif
+        APKC_comparison.jpg
+    """
+    if value is None or pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    stem = Path(text).stem
+    match = re.search(r"[A-Za-z]{4}", stem)
+
+    if not match:
+        return None
+
+    return match.group(0).upper()
+
+
+def collect_qc_sample_codes(
+    explicit_codes: list[str] | None,
+    with_gray_df: pd.DataFrame | None,
+    no_gray_df: pd.DataFrame | None,
+    max_samples: int,
+) -> list[str]:
+    """
+    Decide which sample codes should be shown in the QC chapters.
+
+    Priority:
+        1. codes explicitly passed with --qc-sample-codes
+        2. codes found in with-gray table
+        3. codes found in no-gray table
+    """
+    codes: list[str] = []
+
+    if explicit_codes:
+        for code in explicit_codes:
+            parsed = extract_sample_code(code)
+            if parsed and parsed not in codes:
+                codes.append(parsed)
+
+        return codes[:max_samples]
+
+    candidate_columns = [
+        "sample_code_base",
+        "SampleCode",
+        "ID",
+        "image",
+    ]
+
+    for df in [with_gray_df, no_gray_df]:
+        if df is None:
+            continue
+
+        for col in candidate_columns:
+            if col not in df.columns:
+                continue
+
+            for value in df[col].dropna().tolist():
+                parsed = extract_sample_code(value)
+                if parsed and parsed not in codes:
+                    codes.append(parsed)
+
+                if len(codes) >= max_samples:
+                    return codes
+
+    return codes[:max_samples]
+
+
+def find_case_insensitive_file(directory: Path, filename: str) -> Path | None:
+    """
+    Find a file by exact name, allowing different case.
+    """
+    direct = directory / filename
+
+    if direct.exists():
+        return direct
+
+    if not directory.exists():
+        return None
+
+    target = filename.lower()
+
+    for path in directory.iterdir():
+        if path.is_file() and path.name.lower() == target:
+            return path
+
+    return None
+
+
+def copy_asset_to_report(
+    source: Path | None,
+    out_dir: Path,
+    subdir: str = "assets/qc",
+    output_name: str | None = None,
+) -> str | None:
+    """
+    Copy an image into the report folder so the static HTML can serve it.
+
+    output_name is important when two source files have the same basename,
+    for example:
+
+        outputs/color_cards_with_gray/APKC_comparison.jpg
+        outputs/color_cards_no_gray/APKC_comparison.jpg
+
+    Without different output names, one would overwrite the other.
+    """
+    if source is None or not source.exists():
+        return None
+
+    target_dir = out_dir / subdir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if output_name is None:
+        output_name = source.name
+
+    target = target_dir / output_name
+    shutil.copy2(source, target)
+
+    return target.relative_to(out_dir).as_posix()
+
+
+def image_or_missing_html(
+    title: str,
+    relative_path: str | None,
+    caption: str,
+    missing_note: str,
+) -> str:
+    """
+    Render an image figure, or a visible missing-file note.
+    """
+    if relative_path:
+        return f"""
+<figure>
+  <img src="{html.escape(relative_path)}" alt="{html.escape(title)}">
+  <figcaption>
+    <strong>{html.escape(title)}.</strong>
+    {html.escape(caption)}
+  </figcaption>
+</figure>
+"""
+
+    return f"""
+<figure class="missing-asset">
+  <div class="missing-box">Missing image</div>
+  <figcaption>
+    <strong>{html.escape(title)}.</strong>
+    {html.escape(missing_note)}
+  </figcaption>
+</figure>
+"""
+
+
+def build_qc_examples_html(
+    out_dir: Path,
+    sample_codes: list[str],
+    debug_masks_dir: Path,
+    debug_gray_dir: Path,
+    color_cards_with_gray_dir: Path,
+    color_cards_no_gray_dir: Path,
+) -> str:
+    """
+    Build HTML chapters for image-processing QC examples.
+
+    Includes:
+        a) soil ROI rectangle
+        b) grey-scale ROI and before/after correction
+        c) with-gray vs no-gray colour-card comparison
+    """
+    if not sample_codes:
+        return """
+<section class="section-card">
+  <h2>Image-processing quality control examples</h2>
+  <p>No QC sample codes were found. Use <code>--qc-sample-codes APKC HGCM</code> to add examples manually.</p>
+</section>
+"""
+
+    sample_sections = []
+
+    for code in sample_codes:
+        roi_rect = find_case_insensitive_file(
+            debug_masks_dir,
+            f"{code}_roi_rect.jpg",
+        )
+
+        gray_roi = find_case_insensitive_file(
+            debug_gray_dir,
+            f"{code}_gray_roi.jpg",
+        )
+
+        gray_before_after = find_case_insensitive_file(
+            debug_gray_dir,
+            f"{code}_gray_before_after.jpg",
+        )
+
+        card_with_gray = find_case_insensitive_file(
+            color_cards_with_gray_dir,
+            f"{code}_comparison.jpg",
+        )
+
+        card_no_gray = find_case_insensitive_file(
+            color_cards_no_gray_dir,
+            f"{code}_comparison.jpg",
+        )
+
+        roi_rect_rel = copy_asset_to_report(
+            roi_rect,
+            out_dir,
+            subdir="assets/qc/debug_masks",
+            output_name=f"{code}_roi_rect.jpg",
+        )
+
+        gray_roi_rel = copy_asset_to_report(
+            gray_roi,
+            out_dir,
+            subdir="assets/qc/debug_gray",
+            output_name=f"{code}_gray_roi.jpg",
+        )
+
+        gray_before_after_rel = copy_asset_to_report(
+            gray_before_after,
+            out_dir,
+            subdir="assets/qc/debug_gray",
+            output_name=f"{code}_gray_before_after.jpg",
+        )
+
+        card_with_gray_rel = copy_asset_to_report(
+            card_with_gray,
+            out_dir,
+            subdir="assets/qc/color_cards",
+            output_name=f"{code}_with_gray_comparison.jpg",
+        )
+
+        card_no_gray_rel = copy_asset_to_report(
+            card_no_gray,
+            out_dir,
+            subdir="assets/qc/color_cards",
+            output_name=f"{code}_no_gray_comparison.jpg",
+        )
+
+        sample_sections.append(
+            f"""
+<section class="qc-sample-card">
+  <h3>Sample {html.escape(code)}</h3>
+
+  <p>
+    This example is included to visually check whether the automatic image-processing steps
+    selected the correct soil region, the correct grey-scale reference, and a plausible
+    colour estimate.
+  </p>
+
+  <h4>a) Soil region of interest</h4>
+
+  <div class="figure-grid">
+    {image_or_missing_html(
+        title="Soil ROI rectangle",
+        relative_path=roi_rect_rel,
+        caption=(
+            "The marked rectangle should cover representative soil, not white paper, labels, "
+            "shadows, or the border of the container. If the rectangle includes pale paper, "
+            "the extracted Lab colour can become too bright and organic carbon may be underestimated."
+        ),
+        missing_note=(
+            f"Expected file: {debug_masks_dir.as_posix()}/{code}_roi_rect.jpg"
+        ),
+    )}
+  </div>
+
+  <h4>b) Grey-scale correction diagnostics</h4>
+
+  <div class="figure-grid">
+    {image_or_missing_html(
+        title="Detected grey-scale ROI",
+        relative_path=gray_roi_rel,
+        caption=(
+            "The crop should contain mostly the 11 grey patches, from dark on the left "
+            "to light on the right. Large white margins, printed numbers, or missing patches "
+            "can distort the colour correction."
+        ),
+        missing_note=(
+            f"Expected file: {debug_gray_dir.as_posix()}/{code}_gray_roi.jpg"
+        ),
+    )}
+
+    {image_or_missing_html(
+        title="Before/after grey-scale correction",
+        relative_path=gray_before_after_rel,
+        caption=(
+            "The corrected image should look colour-balanced, but not artificially distorted. "
+            "This panel is useful for detecting failed grey-card correction."
+        ),
+        missing_note=(
+            f"Expected file: {debug_gray_dir.as_posix()}/{code}_gray_before_after.jpg"
+        ),
+    )}
+  </div>
+
+  <h4>c) Colour-card comparison: with grey scale vs no grey scale</h4>
+
+  <div class="figure-grid">
+    {image_or_missing_html(
+        title="With grey-scale correction",
+        relative_path=card_with_gray_rel,
+        caption=(
+            "This card shows the extracted ROI, estimated colour, closest Munsell colour, "
+            "DeltaE2000, and estimated SOC after grey-scale correction."
+        ),
+        missing_note=(
+            f"Expected file: {color_cards_with_gray_dir.as_posix()}/{code}_comparison.jpg"
+        ),
+    )}
+
+    {image_or_missing_html(
+        title="Without grey-scale correction",
+        relative_path=card_no_gray_rel,
+        caption=(
+            "This card shows the same type of diagnostic output without grey-scale correction. "
+            "Large differences between the two cards indicate that colour correction has a strong "
+            "effect on the final estimate."
+        ),
+        missing_note=(
+            f"Expected file: {color_cards_no_gray_dir.as_posix()}/{code}_comparison.jpg"
+        ),
+    )}
+  </div>
+</section>
+"""
+        )
+
+    return f"""
+<section class="section-card">
+  <h2>Image-processing quality control examples</h2>
+
+  <p>
+    These examples are included because numerical performance metrics alone are not enough
+    for this workflow. The algorithm can fail if the soil ROI includes paper, if the grey-scale
+    reference is cropped incorrectly, or if the colour-card output does not visually match the
+    selected soil region.
+  </p>
+
+  <p>
+    The checks below should be interpreted as manual quality-control evidence supporting the
+    statistical results.
+  </p>
+
+  {''.join(sample_sections)}
+</section>
+"""
+
+
+def build_mae_rmse_explanation_html(summary_df: pd.DataFrame) -> str:
+    """
+    Explain MAE and RMSE and compare them across scenarios.
+    """
+    if summary_df.empty or "MAE" not in summary_df.columns or "RMSE" not in summary_df.columns:
+        return """
+<section class="section-card">
+  <h2>How to interpret MAE and RMSE</h2>
+  <p>MAE and RMSE could not be compared because the summary table is incomplete.</p>
+</section>
+"""
+
+    rows = []
+
+    for _, row in summary_df.iterrows():
+        scenario = str(row.get("scenario", "Unknown scenario"))
+        mae = row.get("MAE", np.nan)
+        rmse = row.get("RMSE", np.nan)
+
+        if np.isfinite(mae) and np.isfinite(rmse) and mae > 0:
+            ratio = rmse / mae
+        else:
+            ratio = np.nan
+
+        if np.isfinite(ratio):
+            if ratio > 1.5:
+                comment = (
+                    "RMSE is much higher than MAE, suggesting that a few large errors "
+                    "or outliers may be influencing the result."
+                )
+            elif ratio > 1.2:
+                comment = (
+                    "RMSE is moderately higher than MAE, suggesting some larger errors, "
+                    "but not necessarily extreme failures."
+                )
+            else:
+                comment = (
+                    "RMSE is close to MAE, suggesting that errors are relatively evenly distributed."
+                )
+        else:
+            comment = "The MAE/RMSE relationship could not be evaluated."
+
+        rows.append(
+            f"""
+<tr>
+  <td>{html.escape(scenario)}</td>
+  <td>{fmt(mae)}</td>
+  <td>{fmt(rmse)}</td>
+  <td>{fmt(ratio)}</td>
+  <td>{html.escape(comment)}</td>
+</tr>
+"""
+        )
+
+    valid_mae = summary_df.dropna(subset=["MAE"]).copy()
+    valid_rmse = summary_df.dropna(subset=["RMSE"]).copy()
+
+    best_mae_text = "NA"
+    best_rmse_text = "NA"
+
+    if len(valid_mae) > 0:
+        best_mae_row = valid_mae.loc[valid_mae["MAE"].idxmin()]
+        best_mae_text = f"{best_mae_row['scenario']} with MAE = {fmt(best_mae_row['MAE'])}"
+
+    if len(valid_rmse) > 0:
+        best_rmse_row = valid_rmse.loc[valid_rmse["RMSE"].idxmin()]
+        best_rmse_text = f"{best_rmse_row['scenario']} with RMSE = {fmt(best_rmse_row['RMSE'])}"
+
+    return f"""
+<section class="section-card">
+  <h2>How to interpret MAE and RMSE</h2>
+
+  <p>
+    <strong>MAE</strong> means mean absolute error. It is the average absolute difference
+    between the estimate and the laboratory value. For example, MAE = 4 means that, on
+    average, the method differs from the laboratory orgC value by about 4 percentage points.
+  </p>
+
+  <p>
+    <strong>RMSE</strong> means root mean squared error. It also measures prediction error,
+    but it penalizes large mistakes more strongly than MAE. RMSE is useful for detecting
+    whether a method occasionally fails badly.
+  </p>
+
+  <p>
+    Lower values are better for both metrics. MAE is easier to explain, while RMSE is more
+    sensitive to outliers and large individual errors.
+  </p>
+
+  <p>
+    Best MAE in this report: <strong>{html.escape(best_mae_text)}</strong>.
+    Best RMSE in this report: <strong>{html.escape(best_rmse_text)}</strong>.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>MAE</th>
+        <th>RMSE</th>
+        <th>RMSE / MAE</th>
+        <th>Interpretation</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(rows)}
+    </tbody>
+  </table>
+</section>
+"""
 
 def read_table(path: str | Path, preferred_sheet: str = "enriched") -> pd.DataFrame:
     """Read CSV/XLS/XLSX, preferring a sheet named 'enriched' when present."""
@@ -910,6 +1378,8 @@ def render_html_report(
     out_dir: Path,
     model_info: dict | None,
     title: str,
+    qc_examples_html: str = "",
+    mae_rmse_html: str = "",
 ) -> None:
     figures_dir = out_dir / "figures"
     summary_chart = figures_dir / "method_error_comparison.png"
@@ -1143,6 +1613,47 @@ def render_html_report(
       padding: 14px 16px;
       color: #7c2d12;
     }}
+
+    .qc-sample-card {{
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 18px;
+      margin-top: 22px;
+    }}
+
+    .qc-sample-card h3 {{
+      margin-top: 0;
+      color: #111827;
+    }}
+
+    .qc-sample-card h4 {{
+      margin-top: 22px;
+      margin-bottom: 10px;
+      color: #374151;
+    }}
+
+    .missing-asset {{
+      background: #fef2f2;
+      border-color: #fecaca;
+    }}
+
+    .missing-box {{
+      height: 220px;
+      border-radius: 8px;
+      background: repeating-linear-gradient(
+        45deg,
+        #fee2e2,
+        #fee2e2 10px,
+        #fecaca 10px,
+        #fecaca 20px
+      );
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #991b1b;
+      font-weight: bold;
+    }}
   </style>
 </head>
 
@@ -1185,10 +1696,14 @@ def render_html_report(
 
     {html_model_info(model_info)}
 
-    {''.join(cards)}
+        {''.join(cards)}
 
-    <section class="section-card">
-      <h2>How to present the current status</h2>
+        {mae_rmse_html}
+
+        {qc_examples_html}
+
+        <section class="section-card">
+        <h2>How to present the current status</h2>
 
       <p>The safest scientific interpretation is:</p>
 
@@ -1305,12 +1820,32 @@ def run_report(args: argparse.Namespace) -> None:
     summary_df = pd.DataFrame([metrics_to_summary_row(r) for r in results])
     summary_df.to_csv(out_dir / "summary_metrics.csv", index=False)
 
+    qc_sample_codes = collect_qc_sample_codes(
+        explicit_codes=args.qc_sample_codes,
+        with_gray_df=with_gray_df,
+        no_gray_df=no_gray_df,
+        max_samples=args.qc_max_samples,
+    )
+
+    qc_examples_html = build_qc_examples_html(
+        out_dir=out_dir,
+        sample_codes=qc_sample_codes,
+        debug_masks_dir=Path(args.debug_masks_dir),
+        debug_gray_dir=Path(args.debug_gray_dir),
+        color_cards_with_gray_dir=Path(args.color_cards_with_gray_dir),
+        color_cards_no_gray_dir=Path(args.color_cards_no_gray_dir),
+    )
+
+    mae_rmse_html = build_mae_rmse_explanation_html(summary_df)
+
     render_html_report(
         results=results,
         summary_df=summary_df,
         out_dir=out_dir,
         model_info=model_info,
         title=args.title,
+        qc_examples_html=qc_examples_html,
+        mae_rmse_html=mae_rmse_html,
     )
 
     print("")
@@ -1374,6 +1909,46 @@ def parse_args() -> argparse.Namespace:
         "--title",
         default="Soil orgC comparison report",
         help="Title shown in the HTML report.",
+    )
+    parser.add_argument(
+        "--qc-sample-codes",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional list of sample codes to show in the quality-control chapters, "
+            "for example: --qc-sample-codes APKC HGCM XGXK"
+        ),
+    )
+
+    parser.add_argument(
+        "--qc-max-samples",
+        type=int,
+        default=8,
+        help="Maximum number of automatically selected QC examples to show.",
+    )
+
+    parser.add_argument(
+        "--debug-masks-dir",
+        default="debug_masks",
+        help="Directory containing *_roi_rect.jpg files.",
+    )
+
+    parser.add_argument(
+        "--debug-gray-dir",
+        default="debug_gray",
+        help="Directory containing *_gray_roi.jpg and *_gray_before_after.jpg files.",
+    )
+
+    parser.add_argument(
+        "--color-cards-with-gray-dir",
+        default="outputs/color_cards_with_gray",
+        help="Directory containing with-gray *_comparison.jpg colour cards.",
+    )
+
+    parser.add_argument(
+        "--color-cards-no-gray-dir",
+        default="outputs/color_cards_no_gray",
+        help="Directory containing no-gray *_comparison.jpg colour cards.",
     )
 
     return parser.parse_args()

@@ -12,9 +12,12 @@
 
 python3 scripts/make_presentation_report.py \
   --lab data/lab/test_stat_orgC.xlsx \
-  --no-gray outputs/test_stat_orgC_enriched_no_gray_cv_Lab_prediction.xlsx \
+  --no-gray outputs/test_stat_orgC_enriched_no_gray.xlsx \
   --with-gray outputs/test_stat_orgC_enriched_with_gray.xlsx \
-  --out outputs/presentation_report
+  --out outputs/presentation_report \
+  --qc-sample-codes APKC HGCM XGXK
+# or let it select automatically the QC samples, by not specifying the --qc-sample-codes argument
+#  --qc-max-samples 8
 
 # optional: start a local web server to view the report
 # python3 -m http.server 8088 --directory outputs/presentation_report
