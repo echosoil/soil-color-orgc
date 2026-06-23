@@ -9,6 +9,7 @@ data/samples/*
 data/lab/*
 outputs/*
 debug_masks/*
+debug_gray/*
 
 # Keep folder structure
 !data/samples/.gitkeep
