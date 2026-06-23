@@ -2,7 +2,8 @@ import os
 import cv2
 import numpy as np
 from colour import sRGB_to_XYZ, XYZ_to_Lab
-
+from .gray_calibration import correct_image_using_gray_scale
+from .image_io import read_image_bgr
 
 def ensure_portrait_orientation(image_bgr):
     """
@@ -45,10 +46,10 @@ def downscale_max_side(image_bgr, max_side=1200):
 
 def crop_central_soil_roi(
     image_bgr,
-    x_min=0.10,
-    x_max=0.90,
-    y_min=0.10,
-    y_max=0.90,
+    x_min=0.40,
+    x_max=0.60,
+    y_min=0.50,
+    y_max=0.70,
 ):
     """
     Fixed central crop.
@@ -189,6 +190,7 @@ def extract_dominant_lab(
     downscale_max: int = 1200,
     kmeans_clusters: int = 4,
     trim_percent: float = 0.08,
+    use_gray_calibration: bool = True,
 ):
     """
     Extract representative soil color from a fixed central ROI.
@@ -198,7 +200,7 @@ def extract_dominant_lab(
     Current strategy:
         1. Read image with OpenCV.
         2. Downscale if large.
-        3. Crop central ROI: x 35-65%, y 25-55%.
+        3. Crop central ROI: x 40-60%, y 50-70%.
         4. Build loose mask inside ROI.
         5. Blur ROI to reduce grain-level noise.
         6. Convert selected pixels to Lab.
@@ -208,13 +210,30 @@ def extract_dominant_lab(
     kmeans_clusters is kept in the function signature only so pipeline.py
     does not need to change.
     """
-    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    image_name = os.path.basename(image_path)
+
+    image_bgr = read_image_bgr(image_path, use_icc=True)
 
     if image_bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
     image_bgr = ensure_portrait_orientation(image_bgr)
     image_bgr = downscale_max_side(image_bgr, max_side=downscale_max)
+   
+    if use_gray_calibration:
+        try:
+            image_bgr, gray_report = correct_image_using_gray_scale(
+                image_bgr,
+                n_patches=11,
+                debug_dir="debug_gray" if save_debug_masks else None,
+                image_name=image_name,
+            )
+        except Exception as exc:
+            print(
+                f"  WARNING: grey-scale calibration failed for {image_name}: {exc}. "
+                f"Using uncorrected image.",
+                flush=True,
+            )
 
     roi_bgr, rect = crop_central_soil_roi(
         image_bgr,

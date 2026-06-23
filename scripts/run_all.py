@@ -65,6 +65,12 @@ def main():
         help="Maximum accepted DeltaE2000 for Munsell match.",
     )
 
+    parser.add_argument(
+        "--no-gray-calibration",
+        action="store_true",
+        help="Disable grey-scale colour calibration.",
+    )
+
     args = parser.parse_args()
 
     run_image_pipeline(
@@ -74,6 +80,7 @@ def main():
         debug_dir=args.debug_dir,
         save_debug_masks=not args.no_debug_masks,
         deltae_threshold=args.deltae_threshold,
+        use_gray_calibration=not args.no_gray_calibration,
     )
 
     enrich_lab_file(

@@ -76,6 +76,7 @@ def run_image_pipeline(
     downscale_max: int = 800,
     kmeans_clusters: int = 4,
     trim_percent: float = 0.05,
+    use_gray_calibration: bool = True,
 ):
     print("Loading Munsell table...", flush=True)
     munsell_dict = load_munsell(munsell_csv)
@@ -105,6 +106,7 @@ def run_image_pipeline(
                 downscale_max=downscale_max,
                 kmeans_clusters=kmeans_clusters,
                 trim_percent=trim_percent,
+                use_gray_calibration=use_gray_calibration,
             )
 
             print("  extracting sample code from filename...", flush=True)
