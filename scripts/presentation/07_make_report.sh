@@ -10,14 +10,23 @@
 ./scripts/presentation/05_*
 ./scripts/presentation/06_*
 
+python3 scripts/run_model_experiment.py \
+  --with-gray outputs/test_stat_orgC_enriched_with_gray.xlsx \
+  --munsell data/munsell/rit_munsell.csv \
+  --target orgC_lab \
+  --test-count 51 \
+  --cv-repeats 10 \
+  --munsell-neighbours 6 \
+  --seed 42 \
+  --out outputs/model_experiment
+
 python3 scripts/make_presentation_report.py \
   --lab data/lab/test_stat_orgC.xlsx \
-  --no-gray outputs/test_stat_orgC_enriched_no_gray.xlsx \
   --with-gray outputs/test_stat_orgC_enriched_with_gray.xlsx \
+  --experiment-dir outputs/model_experiment \
   --out outputs/presentation_report \
-  --qc-sample-codes APKC HGCM XGXK
-# or let it select automatically the QC samples, by not specifying the --qc-sample-codes argument
-#  --qc-max-samples 8
+  --qc-max-samples 4
+#  --qc-sample-codes APKC HGCM XGXK
 
 # optional: start a local web server to view the report
 # python3 -m http.server 8088 --directory outputs/presentation_report

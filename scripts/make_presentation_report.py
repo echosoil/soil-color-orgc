@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""
-Generate an automated static HTML report comparing:
+"""Generate a grey-scale-only soil orgC model and QC report.
 
-1. Laboratory orgC vs citizen-science orgC estimates.
-2. Laboratory orgC vs image algorithm without grey-scale correction, using
-   cross-validated training.
-3. Laboratory orgC vs image algorithm with grey-scale correction, without
-   training, because the current grey-scale subset is still too small.
+The report uses only:
+1. Laboratory orgC vs citizen-science estimates as an external baseline.
+2. The direct grey-scale-corrected SOC formula as a non-trained baseline.
+3. The grey-scale-only model experiment produced by run_model_experiment.py.
+4. Grey-scale detection, correction, soil-ROI, and colour-card QC images.
 
-Example
--------
-python3 scripts/make_presentation_report.py \
-  --lab data/lab/test_stat_orgC.xlsx \
-  --no-gray outputs/test_stat_orgC_enriched_no_gray.xlsx \
-  --with-gray outputs/test_stat_orgC_enriched_with_gray.xlsx \
-  --out outputs/presentation_report
+The report never trains models and never uses another image dataset. Model
+selection is based on repeated cross-validation in the experiment output; the
+held-out test set is used only for final evaluation.
 """
 
 from __future__ import annotations
@@ -27,21 +22,15 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib
-
 matplotlib.use("Agg")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, LeaveOneOut, cross_val_predict
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 
 @dataclass
@@ -54,536 +43,32 @@ class ComparisonResult:
     y_pred_col: str
     method_note: str
     metrics: dict
-    figures: dict
     interpretation: list[str]
+    figures: dict | None = None
 
 
 def fmt(value, digits: int = 3) -> str:
-    """Format a numeric value for display."""
-    if value is None:
-        return "NA"
-
     try:
-        value = float(value)
-    except Exception:
+        number = float(value)
+    except (TypeError, ValueError):
         return "NA"
-
-    if not np.isfinite(value):
-        return "NA"
-
-    return f"{value:.{digits}f}"
-
-
-def fmt_p(value) -> str:
-    """Format a p-value for display."""
-    if value is None:
-        return "NA"
-
-    try:
-        value = float(value)
-    except Exception:
-        return "NA"
-
-    if not np.isfinite(value):
-        return "NA"
-
-    if value < 0.001:
-        return "<0.001"
-
-    return f"{value:.3f}"
+    return f"{number:.{digits}f}" if np.isfinite(number) else "NA"
 
 
 def slugify(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = text.strip("_")
-    return text or "section"
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "section"
 
-def extract_sample_code(value) -> str | None:
-    """
-    Extract a four-letter sample code from ID, SampleCode, sample_code_base, or image name.
-
-    Examples:
-        APKC
-        APKC-1234
-        APKC.jfif
-        APKC_comparison.jpg
-    """
-    if value is None or pd.isna(value):
-        return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    stem = Path(text).stem
-    match = re.search(r"[A-Za-z]{4}", stem)
-
-    if not match:
-        return None
-
-    return match.group(0).upper()
-
-
-def collect_qc_sample_codes(
-    explicit_codes: list[str] | None,
-    with_gray_df: pd.DataFrame | None,
-    no_gray_df: pd.DataFrame | None,
-    max_samples: int,
-) -> list[str]:
-    """
-    Decide which sample codes should be shown in the QC chapters.
-
-    Priority:
-        1. codes explicitly passed with --qc-sample-codes
-        2. codes found in with-gray table
-        3. codes found in no-gray table
-    """
-    codes: list[str] = []
-
-    if explicit_codes:
-        for code in explicit_codes:
-            parsed = extract_sample_code(code)
-            if parsed and parsed not in codes:
-                codes.append(parsed)
-
-        return codes[:max_samples]
-
-    candidate_columns = [
-        "sample_code_base",
-        "SampleCode",
-        "ID",
-        "image",
-    ]
-
-    for df in [with_gray_df, no_gray_df]:
-        if df is None:
-            continue
-
-        for col in candidate_columns:
-            if col not in df.columns:
-                continue
-
-            for value in df[col].dropna().tolist():
-                parsed = extract_sample_code(value)
-                if parsed and parsed not in codes:
-                    codes.append(parsed)
-
-                if len(codes) >= max_samples:
-                    return codes
-
-    return codes[:max_samples]
-
-
-def find_case_insensitive_file(directory: Path, filename: str) -> Path | None:
-    """
-    Find a file by exact name, allowing different case.
-    """
-    direct = directory / filename
-
-    if direct.exists():
-        return direct
-
-    if not directory.exists():
-        return None
-
-    target = filename.lower()
-
-    for path in directory.iterdir():
-        if path.is_file() and path.name.lower() == target:
-            return path
-
-    return None
-
-
-def copy_asset_to_report(
-    source: Path | None,
-    out_dir: Path,
-    subdir: str = "assets/qc",
-    output_name: str | None = None,
-) -> str | None:
-    """
-    Copy an image into the report folder so the static HTML can serve it.
-
-    output_name is important when two source files have the same basename,
-    for example:
-
-        outputs/color_cards_with_gray/APKC_comparison.jpg
-        outputs/color_cards_no_gray/APKC_comparison.jpg
-
-    Without different output names, one would overwrite the other.
-    """
-    if source is None or not source.exists():
-        return None
-
-    target_dir = out_dir / subdir
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    if output_name is None:
-        output_name = source.name
-
-    target = target_dir / output_name
-    shutil.copy2(source, target)
-
-    return target.relative_to(out_dir).as_posix()
-
-
-def image_or_missing_html(
-    title: str,
-    relative_path: str | None,
-    caption: str,
-    missing_note: str,
-) -> str:
-    """
-    Render an image figure, or a visible missing-file note.
-    """
-    if relative_path:
-        return f"""
-<figure>
-  <img src="{html.escape(relative_path)}" alt="{html.escape(title)}">
-  <figcaption>
-    <strong>{html.escape(title)}.</strong>
-    {html.escape(caption)}
-  </figcaption>
-</figure>
-"""
-
-    return f"""
-<figure class="missing-asset">
-  <div class="missing-box">Missing image</div>
-  <figcaption>
-    <strong>{html.escape(title)}.</strong>
-    {html.escape(missing_note)}
-  </figcaption>
-</figure>
-"""
-
-
-def build_qc_examples_html(
-    out_dir: Path,
-    sample_codes: list[str],
-    debug_masks_dir: Path,
-    debug_gray_dir: Path,
-    color_cards_with_gray_dir: Path,
-    color_cards_no_gray_dir: Path,
-) -> str:
-    """
-    Build HTML chapters for image-processing QC examples.
-
-    Includes:
-        a) soil ROI rectangle
-        b) grey-scale ROI and before/after correction
-        c) with-gray vs no-gray colour-card comparison
-    """
-    if not sample_codes:
-        return """
-<section class="section-card">
-  <h2>Image-processing quality control examples</h2>
-  <p>No QC sample codes were found. Use <code>--qc-sample-codes APKC HGCM</code> to add examples manually.</p>
-</section>
-"""
-
-    sample_sections = []
-
-    for code in sample_codes:
-        roi_rect = find_case_insensitive_file(
-            debug_masks_dir,
-            f"{code}_roi_rect.jpg",
-        )
-
-        gray_roi = find_case_insensitive_file(
-            debug_gray_dir,
-            f"{code}_gray_roi.jpg",
-        )
-
-        gray_before_after = find_case_insensitive_file(
-            debug_gray_dir,
-            f"{code}_gray_before_after.jpg",
-        )
-
-        card_with_gray = find_case_insensitive_file(
-            color_cards_with_gray_dir,
-            f"{code}_comparison.jpg",
-        )
-
-        card_no_gray = find_case_insensitive_file(
-            color_cards_no_gray_dir,
-            f"{code}_comparison.jpg",
-        )
-
-        roi_rect_rel = copy_asset_to_report(
-            roi_rect,
-            out_dir,
-            subdir="assets/qc/debug_masks",
-            output_name=f"{code}_roi_rect.jpg",
-        )
-
-        gray_roi_rel = copy_asset_to_report(
-            gray_roi,
-            out_dir,
-            subdir="assets/qc/debug_gray",
-            output_name=f"{code}_gray_roi.jpg",
-        )
-
-        gray_before_after_rel = copy_asset_to_report(
-            gray_before_after,
-            out_dir,
-            subdir="assets/qc/debug_gray",
-            output_name=f"{code}_gray_before_after.jpg",
-        )
-
-        card_with_gray_rel = copy_asset_to_report(
-            card_with_gray,
-            out_dir,
-            subdir="assets/qc/color_cards",
-            output_name=f"{code}_with_gray_comparison.jpg",
-        )
-
-        card_no_gray_rel = copy_asset_to_report(
-            card_no_gray,
-            out_dir,
-            subdir="assets/qc/color_cards",
-            output_name=f"{code}_no_gray_comparison.jpg",
-        )
-
-        sample_sections.append(
-            f"""
-<section class="qc-sample-card">
-  <h3>Sample {html.escape(code)}</h3>
-
-  <p>
-    This example is included to visually check whether the automatic image-processing steps
-    selected the correct soil region, the correct grey-scale reference, and a plausible
-    colour estimate.
-  </p>
-
-  <h4>a) Soil region of interest</h4>
-
-  <div class="figure-grid">
-    {image_or_missing_html(
-        title="Soil ROI rectangle",
-        relative_path=roi_rect_rel,
-        caption=(
-            "The marked rectangle should cover representative soil, not white paper, labels, "
-            "shadows, or the border of the container. If the rectangle includes pale paper, "
-            "the extracted Lab colour can become too bright and organic carbon may be underestimated."
-        ),
-        missing_note=(
-            f"Expected file: {debug_masks_dir.as_posix()}/{code}_roi_rect.jpg"
-        ),
-    )}
-  </div>
-
-  <h4>b) Grey-scale correction diagnostics</h4>
-
-  <div class="figure-grid">
-    {image_or_missing_html(
-        title="Detected grey-scale ROI",
-        relative_path=gray_roi_rel,
-        caption=(
-            "The crop should contain mostly the 11 grey patches, from dark on the left "
-            "to light on the right. Large white margins, printed numbers, or missing patches "
-            "can distort the colour correction."
-        ),
-        missing_note=(
-            f"Expected file: {debug_gray_dir.as_posix()}/{code}_gray_roi.jpg"
-        ),
-    )}
-
-    {image_or_missing_html(
-        title="Before/after grey-scale correction",
-        relative_path=gray_before_after_rel,
-        caption=(
-            "The corrected image should look colour-balanced, but not artificially distorted. "
-            "This panel is useful for detecting failed grey-card correction."
-        ),
-        missing_note=(
-            f"Expected file: {debug_gray_dir.as_posix()}/{code}_gray_before_after.jpg"
-        ),
-    )}
-  </div>
-
-  <h4>c) Colour-card comparison: with grey scale vs no grey scale</h4>
-
-  <div class="figure-grid">
-    {image_or_missing_html(
-        title="With grey-scale correction",
-        relative_path=card_with_gray_rel,
-        caption=(
-            "This card shows the extracted ROI, estimated colour, closest Munsell colour, "
-            "DeltaE2000, and estimated SOC after grey-scale correction."
-        ),
-        missing_note=(
-            f"Expected file: {color_cards_with_gray_dir.as_posix()}/{code}_comparison.jpg"
-        ),
-    )}
-
-    {image_or_missing_html(
-        title="Without grey-scale correction",
-        relative_path=card_no_gray_rel,
-        caption=(
-            "This card shows the same type of diagnostic output without grey-scale correction. "
-            "Large differences between the two cards indicate that colour correction has a strong "
-            "effect on the final estimate."
-        ),
-        missing_note=(
-            f"Expected file: {color_cards_no_gray_dir.as_posix()}/{code}_comparison.jpg"
-        ),
-    )}
-  </div>
-</section>
-"""
-        )
-
-    return f"""
-<section class="section-card">
-  <h2>Image-processing quality control examples</h2>
-
-  <p>
-    These examples are included because numerical performance metrics alone are not enough
-    for this workflow. The algorithm can fail if the soil ROI includes paper, if the grey-scale
-    reference is cropped incorrectly, or if the colour-card output does not visually match the
-    selected soil region.
-  </p>
-
-  <p>
-    The checks below should be interpreted as manual quality-control evidence supporting the
-    statistical results.
-  </p>
-
-  {''.join(sample_sections)}
-</section>
-"""
-
-
-def build_mae_rmse_explanation_html(summary_df: pd.DataFrame) -> str:
-    """
-    Explain MAE and RMSE and compare them across scenarios.
-    """
-    if summary_df.empty or "MAE" not in summary_df.columns or "RMSE" not in summary_df.columns:
-        return """
-<section class="section-card">
-  <h2>How to interpret MAE and RMSE</h2>
-  <p>MAE and RMSE could not be compared because the summary table is incomplete.</p>
-</section>
-"""
-
-    rows = []
-
-    for _, row in summary_df.iterrows():
-        scenario = str(row.get("scenario", "Unknown scenario"))
-        mae = row.get("MAE", np.nan)
-        rmse = row.get("RMSE", np.nan)
-
-        if np.isfinite(mae) and np.isfinite(rmse) and mae > 0:
-            ratio = rmse / mae
-        else:
-            ratio = np.nan
-
-        if np.isfinite(ratio):
-            if ratio > 1.5:
-                comment = (
-                    "RMSE is much higher than MAE, suggesting that a few large errors "
-                    "or outliers may be influencing the result."
-                )
-            elif ratio > 1.2:
-                comment = (
-                    "RMSE is moderately higher than MAE, suggesting some larger errors, "
-                    "but not necessarily extreme failures."
-                )
-            else:
-                comment = (
-                    "RMSE is close to MAE, suggesting that errors are relatively evenly distributed."
-                )
-        else:
-            comment = "The MAE/RMSE relationship could not be evaluated."
-
-        rows.append(
-            f"""
-<tr>
-  <td>{html.escape(scenario)}</td>
-  <td>{fmt(mae)}</td>
-  <td>{fmt(rmse)}</td>
-  <td>{fmt(ratio)}</td>
-  <td>{html.escape(comment)}</td>
-</tr>
-"""
-        )
-
-    valid_mae = summary_df.dropna(subset=["MAE"]).copy()
-    valid_rmse = summary_df.dropna(subset=["RMSE"]).copy()
-
-    best_mae_text = "NA"
-    best_rmse_text = "NA"
-
-    if len(valid_mae) > 0:
-        best_mae_row = valid_mae.loc[valid_mae["MAE"].idxmin()]
-        best_mae_text = f"{best_mae_row['scenario']} with MAE = {fmt(best_mae_row['MAE'])}"
-
-    if len(valid_rmse) > 0:
-        best_rmse_row = valid_rmse.loc[valid_rmse["RMSE"].idxmin()]
-        best_rmse_text = f"{best_rmse_row['scenario']} with RMSE = {fmt(best_rmse_row['RMSE'])}"
-
-    return f"""
-<section class="section-card">
-  <h2>How to interpret MAE and RMSE</h2>
-
-  <p>
-    <strong>MAE</strong> means mean absolute error. It is the average absolute difference
-    between the estimate and the laboratory value. For example, MAE = 4 means that, on
-    average, the method differs from the laboratory orgC value by about 4 percentage points.
-  </p>
-
-  <p>
-    <strong>RMSE</strong> means root mean squared error. It also measures prediction error,
-    but it penalizes large mistakes more strongly than MAE. RMSE is useful for detecting
-    whether a method occasionally fails badly.
-  </p>
-
-  <p>
-    Lower values are better for both metrics. MAE is easier to explain, while RMSE is more
-    sensitive to outliers and large individual errors.
-  </p>
-
-  <p>
-    Best MAE in this report: <strong>{html.escape(best_mae_text)}</strong>.
-    Best RMSE in this report: <strong>{html.escape(best_rmse_text)}</strong>.
-  </p>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Scenario</th>
-        <th>MAE</th>
-        <th>RMSE</th>
-        <th>RMSE / MAE</th>
-        <th>Interpretation</th>
-      </tr>
-    </thead>
-    <tbody>
-      {''.join(rows)}
-    </tbody>
-  </table>
-</section>
-"""
 
 def read_table(path: str | Path, preferred_sheet: str = "enriched") -> pd.DataFrame:
-    """Read CSV/XLS/XLSX, preferring a sheet named 'enriched' when present."""
     path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-
-    suffix = path.suffix.lower()
-
-    if suffix in {".xlsx", ".xls"}:
-        xls = pd.ExcelFile(path)
-        sheet = preferred_sheet if preferred_sheet in xls.sheet_names else xls.sheet_names[0]
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        book = pd.ExcelFile(path)
+        sheet = preferred_sheet if preferred_sheet in book.sheet_names else book.sheet_names[0]
         return pd.read_excel(path, sheet_name=sheet)
-
-    if suffix == ".csv":
+    if path.suffix.lower() == ".csv":
         return pd.read_csv(path)
-
     raise ValueError(f"Unsupported file type: {path}")
 
 
@@ -594,1369 +79,577 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_processing_ok(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep successful rows when a processing_status column exists."""
-    df = df.copy()
-
     if "processing_status" not in df.columns:
-        return df
-
-    status = df["processing_status"].astype(str).str.lower().str.strip()
-    keep = status.isin(["ok", "nan", "", "none"])
-
-    return df.loc[keep].copy()
+        return df.copy()
+    status = df["processing_status"].fillna("").astype(str).str.lower().str.strip()
+    return df.loc[status.isin({"ok", "", "none", "nan"})].copy()
 
 
-def clean_pair_df(
-    df: pd.DataFrame,
-    y_true_col: str,
-    y_pred_col: str,
-    extra_cols: list[str] | None = None,
-) -> pd.DataFrame:
-    """Keep identifier columns and rows with valid numeric true/predicted values."""
-    df = df.copy()
-
-    required = [y_true_col, y_pred_col]
-    if extra_cols:
-        required += extra_cols
-
-    missing = [c for c in required if c not in df.columns]
+def clean_pair_df(df: pd.DataFrame, true_col: str, pred_col: str) -> pd.DataFrame:
+    missing = [c for c in [true_col, pred_col] if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}")
-
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    keep_cols = []
-
-    for candidate in ["ID", "SampleCode", "sample_code_base", "image"]:
-        if candidate in df.columns:
-            keep_cols.append(candidate)
-
-    keep_cols += required
-    keep_cols = list(dict.fromkeys(keep_cols))
-
-    return df[keep_cols].dropna(subset=[y_true_col, y_pred_col]).copy()
+        raise ValueError(f"Missing comparison columns: {missing}")
+    df = df.copy()
+    df[true_col] = pd.to_numeric(df[true_col], errors="coerce")
+    df[pred_col] = pd.to_numeric(df[pred_col], errors="coerce")
+    keep = [c for c in ["ID", "SampleCode", "sample_code_base", "image", "model"] if c in df.columns]
+    keep += [true_col, pred_col]
+    return df[list(dict.fromkeys(keep))].dropna(subset=[true_col, pred_col]).copy()
 
 
 def compute_ccc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Lin's concordance correlation coefficient."""
     if len(y_true) < 2:
         return np.nan
-
-    mean_true = np.mean(y_true)
-    mean_pred = np.mean(y_pred)
     var_true = np.var(y_true, ddof=1)
     var_pred = np.var(y_pred, ddof=1)
     covariance = np.cov(y_true, y_pred, ddof=1)[0, 1]
-
-    denominator = var_true + var_pred + (mean_true - mean_pred) ** 2
-
-    if denominator == 0:
-        return np.nan
-
-    return float((2 * covariance) / denominator)
+    denominator = var_true + var_pred + (np.mean(y_true) - np.mean(y_pred)) ** 2
+    return float(2 * covariance / denominator) if denominator else np.nan
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+def compute_metrics(y_true, y_pred) -> dict:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-
-    mask = np.isfinite(y_true) & np.isfinite(y_pred)
-    y_true = y_true[mask]
-    y_pred = y_pred[mask]
-
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true, y_pred = y_true[valid], y_pred[valid]
     n = len(y_true)
-
     out = {
-        "n": n,
-        "lab_mean": np.nan,
-        "lab_sd": np.nan,
-        "estimate_mean": np.nan,
-        "estimate_sd": np.nan,
-        "pearson_r": np.nan,
-        "pearson_p": np.nan,
-        "spearman_r": np.nan,
-        "spearman_p": np.nan,
-        "CCC_agreement": np.nan,
-        "bias_mean_estimate_minus_lab": np.nan,
-        "median_error_estimate_minus_lab": np.nan,
-        "MAE": np.nan,
-        "median_absolute_error": np.nan,
-        "RMSE": np.nan,
-        "R2_direct_prediction": np.nan,
-        "bland_altman_lower_95": np.nan,
-        "bland_altman_upper_95": np.nan,
-        "calibration_intercept_lab_from_estimate": np.nan,
-        "calibration_slope_lab_from_estimate": np.nan,
-        "R2_calibration_regression": np.nan,
+        "n": n, "lab_mean": np.nan, "lab_sd": np.nan,
+        "estimate_mean": np.nan, "estimate_sd": np.nan,
+        "pearson_r": np.nan, "pearson_p": np.nan,
+        "spearman_r": np.nan, "spearman_p": np.nan,
+        "CCC_agreement": np.nan, "bias_mean_estimate_minus_lab": np.nan,
+        "MAE": np.nan, "RMSE": np.nan, "R2_direct_prediction": np.nan,
+        "bland_altman_lower_95": np.nan, "bland_altman_upper_95": np.nan,
     }
-
     if n == 0:
         return out
-
     residual = y_pred - y_true
-
-    out["lab_mean"] = float(np.mean(y_true))
-    out["estimate_mean"] = float(np.mean(y_pred))
-    out["bias_mean_estimate_minus_lab"] = float(np.mean(residual))
-    out["median_error_estimate_minus_lab"] = float(np.median(residual))
-    out["MAE"] = float(mean_absolute_error(y_true, y_pred))
-    out["median_absolute_error"] = float(np.median(np.abs(residual)))
-    out["RMSE"] = float(math.sqrt(mean_squared_error(y_true, y_pred)))
-
+    out.update({
+        "lab_mean": float(np.mean(y_true)),
+        "estimate_mean": float(np.mean(y_pred)),
+        "bias_mean_estimate_minus_lab": float(np.mean(residual)),
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(math.sqrt(mean_squared_error(y_true, y_pred))),
+    })
     if n >= 2:
         out["lab_sd"] = float(np.std(y_true, ddof=1))
         out["estimate_sd"] = float(np.std(y_pred, ddof=1))
         out["CCC_agreement"] = compute_ccc(y_true, y_pred)
-
-        try:
-            out["R2_direct_prediction"] = float(r2_score(y_true, y_pred))
-        except Exception:
-            pass
-
-        residual_sd = float(np.std(residual, ddof=1))
+        out["R2_direct_prediction"] = float(r2_score(y_true, y_pred))
+        sd = float(np.std(residual, ddof=1))
         bias = out["bias_mean_estimate_minus_lab"]
-
-        out["bland_altman_lower_95"] = float(bias - 1.96 * residual_sd)
-        out["bland_altman_upper_95"] = float(bias + 1.96 * residual_sd)
-
+        out["bland_altman_lower_95"] = bias - 1.96 * sd
+        out["bland_altman_upper_95"] = bias + 1.96 * sd
     if n >= 3 and np.std(y_true) > 0 and np.std(y_pred) > 0:
-        try:
-            pearson = stats.pearsonr(y_true, y_pred)
-            out["pearson_r"] = float(pearson.statistic)
-            out["pearson_p"] = float(pearson.pvalue)
-        except Exception:
-            pass
-
-        try:
-            spearman = stats.spearmanr(y_true, y_pred)
-            out["spearman_r"] = float(spearman.statistic)
-            out["spearman_p"] = float(spearman.pvalue)
-        except Exception:
-            pass
-
-        try:
-            model = LinearRegression()
-            model.fit(y_pred.reshape(-1, 1), y_true)
-            calibrated = model.predict(y_pred.reshape(-1, 1))
-
-            out["calibration_intercept_lab_from_estimate"] = float(model.intercept_)
-            out["calibration_slope_lab_from_estimate"] = float(model.coef_[0])
-            out["R2_calibration_regression"] = float(r2_score(y_true, calibrated))
-        except Exception:
-            pass
-
+        pearson = stats.pearsonr(y_true, y_pred)
+        spearman = stats.spearmanr(y_true, y_pred)
+        out["pearson_r"], out["pearson_p"] = float(pearson.statistic), float(pearson.pvalue)
+        out["spearman_r"], out["spearman_p"] = float(spearman.statistic), float(spearman.pvalue)
     return out
 
 
-def choose_cv(n: int):
-    if n < 3:
-        raise ValueError("At least 3 samples are required for cross-validation.")
-
-    if n <= 50:
-        return LeaveOneOut()
-
-    return KFold(n_splits=5, shuffle=True, random_state=42)
-
-
-def train_cv_predictions(
-    df: pd.DataFrame,
-    target_col: str,
-    feature_cols: list[str],
-    prediction_col: str = "predicted_orgC_cv",
-) -> tuple[pd.DataFrame, dict]:
-    """Train a simple calibrated model and return cross-validated predictions."""
-    df = df.copy()
-
-    for col in [target_col] + feature_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=[target_col] + feature_cols).copy()
-
-    if len(df) < 3:
-        raise ValueError(f"Not enough rows for training. Need at least 3, got {len(df)}.")
-
-    X = df[feature_cols].to_numpy(dtype=float)
-    y = df[target_col].to_numpy(dtype=float)
-
-    model = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            ("regression", LinearRegression()),
-        ]
-    )
-
-    cv = choose_cv(len(df))
-    y_pred_cv = cross_val_predict(model, X, y, cv=cv)
-
-    df[prediction_col] = y_pred_cv
-
-    # Fit final model on all data only for reporting coefficients.
-    model.fit(X, y)
-
-    regression = model.named_steps["regression"]
-    scaler = model.named_steps["scaler"]
-
-    coef_original_units = regression.coef_ / scaler.scale_
-    intercept_original_units = regression.intercept_ - np.sum(
-        regression.coef_ * scaler.mean_ / scaler.scale_
-    )
-
-    model_info = {
-        "n_training_rows": len(df),
-        "features": feature_cols,
-        "cv": "LeaveOneOut" if len(df) <= 50 else "5-fold shuffled CV",
-        "intercept_original_units": float(intercept_original_units),
-        "coefficients_original_units": {
-            col: float(coef) for col, coef in zip(feature_cols, coef_original_units)
-        },
+def load_model_experiment(experiment_dir: str | Path) -> dict:
+    """Load experiment outputs and retain dataset='with_gray' only."""
+    root = Path(experiment_dir)
+    paths = {
+        "summary": root / "model_experiment_summary.csv",
+        "predictions": root / "model_experiment_predictions.csv",
+        "split": root / "model_experiment_split.csv",
+        "features": root / "model_experiment_features.csv",
     }
+    missing = [str(paths[k]) for k in ["summary", "predictions", "split"] if not paths[k].exists()]
+    if missing:
+        raise FileNotFoundError("Missing model-experiment outputs:\n  " + "\n  ".join(missing))
 
-    return df, model_info
+    summary = normalize_columns(pd.read_csv(paths["summary"]))
+    predictions = normalize_columns(pd.read_csv(paths["predictions"]))
+    split = normalize_columns(pd.read_csv(paths["split"]))
+    features = normalize_columns(pd.read_csv(paths["features"])) if paths["features"].exists() else None
+
+    for name, df in [("summary", summary), ("predictions", predictions)]:
+        if "dataset" not in df.columns:
+            raise ValueError(f"Experiment {name} must contain a 'dataset' column.")
+
+    summary = summary[summary["dataset"].astype(str).str.lower().eq("with_gray")].copy()
+    predictions = predictions[predictions["dataset"].astype(str).str.lower().eq("with_gray")].copy()
+    if features is not None and "dataset" in features.columns:
+        features = features[features["dataset"].astype(str).str.lower().eq("with_gray")].copy()
+
+    if summary.empty or predictions.empty:
+        raise ValueError("Experiment outputs contain no dataset='with_gray' rows.")
+
+    required_summary = {"model", "cv_RMSE_mean", "cv_MAE_mean", "test_MAE", "test_RMSE", "test_R2", "test_pearson_r"}
+    required_predictions = {"model", "lab_value", "predicted_value"}
+    if required_summary - set(summary.columns):
+        raise ValueError(f"Experiment summary missing: {sorted(required_summary - set(summary.columns))}")
+    if required_predictions - set(predictions.columns):
+        raise ValueError(f"Experiment predictions missing: {sorted(required_predictions - set(predictions.columns))}")
+
+    return {"summary": summary, "predictions": predictions, "split": split, "features": features}
 
 
-def make_scatter_plot(
-    df: pd.DataFrame,
-    y_true_col: str,
-    y_pred_col: str,
-    title: str,
-    subtitle: str,
-    output_path: Path,
-    metrics: dict,
-) -> None:
-    y_true = df[y_true_col].to_numpy(dtype=float)
-    y_pred = df[y_pred_col].to_numpy(dtype=float)
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(y_true, y_pred, alpha=0.8)
-
-    finite = np.isfinite(y_true) & np.isfinite(y_pred)
-
-    if finite.any():
-        min_val = float(np.nanmin([np.min(y_true[finite]), np.min(y_pred[finite])]))
-        max_val = float(np.nanmax([np.max(y_true[finite]), np.max(y_pred[finite])]))
-        padding = (max_val - min_val) * 0.08 if max_val > min_val else 1.0
-        min_axis = min_val - padding
-        max_axis = max_val + padding
-
-        ax.plot([min_axis, max_axis], [min_axis, max_axis], linestyle="--")
-        ax.set_xlim(min_axis, max_axis)
-        ax.set_ylim(min_axis, max_axis)
-
-    label = (
-        f"n = {metrics.get('n', 0)}\n"
-        f"Pearson r = {fmt(metrics.get('pearson_r'))}\n"
-        f"Spearman r = {fmt(metrics.get('spearman_r'))}\n"
-        f"MAE = {fmt(metrics.get('MAE'))}\n"
-        f"RMSE = {fmt(metrics.get('RMSE'))}\n"
-        f"R² = {fmt(metrics.get('R2_direct_prediction'))}"
+def select_best_model_by_cv(summary: pd.DataFrame) -> pd.Series:
+    candidates = summary[summary["model"].astype(str).ne("baseline_mean")].copy()
+    candidates["cv_RMSE_mean"] = pd.to_numeric(candidates["cv_RMSE_mean"], errors="coerce")
+    candidates["cv_MAE_mean"] = pd.to_numeric(candidates["cv_MAE_mean"], errors="coerce")
+    candidates = candidates.dropna(subset=["cv_RMSE_mean", "cv_MAE_mean"]).sort_values(
+        ["cv_RMSE_mean", "cv_MAE_mean", "model"]
     )
+    if candidates.empty:
+        raise ValueError("No non-baseline model has valid cross-validation metrics.")
+    return candidates.iloc[0]
 
-    ax.text(
-        0.04,
-        0.96,
-        label,
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        bbox={"boxstyle": "round", "alpha": 0.15},
-    )
-
-    ax.set_title(title)
-    ax.set_xlabel("Laboratory orgC")
-    ax.set_ylabel(subtitle)
-    ax.grid(True, alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def make_bland_altman_plot(
-    df: pd.DataFrame,
-    y_true_col: str,
-    y_pred_col: str,
-    title: str,
-    output_path: Path,
-    metrics: dict,
-) -> None:
-    y_true = df[y_true_col].to_numpy(dtype=float)
-    y_pred = df[y_pred_col].to_numpy(dtype=float)
-
-    mean_values = (y_true + y_pred) / 2.0
-    residual = y_pred - y_true
-
-    bias = metrics.get("bias_mean_estimate_minus_lab", np.nan)
-    lower = metrics.get("bland_altman_lower_95", np.nan)
-    upper = metrics.get("bland_altman_upper_95", np.nan)
-
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-    ax.scatter(mean_values, residual, alpha=0.8)
-
-    if np.isfinite(bias):
-        ax.axhline(bias, linestyle="-", label=f"Bias = {fmt(bias)}")
-
-    if np.isfinite(lower):
-        ax.axhline(lower, linestyle="--", label=f"Lower 95% = {fmt(lower)}")
-
-    if np.isfinite(upper):
-        ax.axhline(upper, linestyle="--", label=f"Upper 95% = {fmt(upper)}")
-
-    ax.axhline(0, linestyle=":", label="Zero error")
-    ax.set_title(title)
-    ax.set_xlabel("Mean of laboratory and estimate")
-    ax.set_ylabel("Estimate minus laboratory")
-    ax.grid(True, alpha=0.25)
-    ax.legend(fontsize=8)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def make_residual_plot(
-    df: pd.DataFrame,
-    y_true_col: str,
-    y_pred_col: str,
-    title: str,
-    output_path: Path,
-) -> None:
-    y_true = df[y_true_col].to_numpy(dtype=float)
-    y_pred = df[y_pred_col].to_numpy(dtype=float)
-    residual = y_pred - y_true
-
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-    ax.scatter(y_true, residual, alpha=0.8)
-    ax.axhline(0, linestyle=":")
-    ax.set_title(title)
-    ax.set_xlabel("Laboratory orgC")
-    ax.set_ylabel("Estimate minus laboratory")
-    ax.grid(True, alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def make_metrics_bar_plot(summary_df: pd.DataFrame, output_path: Path) -> None:
-    plot_df = summary_df.copy()
-
-    required = ["scenario", "MAE", "RMSE"]
-    if any(c not in plot_df.columns for c in required):
-        return
-
-    scenarios = plot_df["scenario"].astype(str).tolist()
-    x = np.arange(len(scenarios))
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-
-    width = 0.35
-    mae = plot_df["MAE"].to_numpy(dtype=float)
-    rmse = plot_df["RMSE"].to_numpy(dtype=float)
-
-    ax.bar(x - width / 2, mae, width, label="MAE")
-    ax.bar(x + width / 2, rmse, width, label="RMSE")
-
-    ax.set_title("Error comparison across methods")
-    ax.set_ylabel("Error")
-    ax.set_xticks(x)
-    ax.set_xticklabels(scenarios, rotation=20, ha="right")
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend()
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def create_figures(result: ComparisonResult, figures_dir: Path) -> dict:
-    figures_dir.mkdir(parents=True, exist_ok=True)
-
-    key = slugify(result.key)
-
-    scatter_path = figures_dir / f"{key}_scatter.png"
-    bland_path = figures_dir / f"{key}_bland_altman.png"
-    residual_path = figures_dir / f"{key}_residual.png"
-
-    make_scatter_plot(
-        result.df,
-        result.y_true_col,
-        result.y_pred_col,
-        title=f"{result.title}: laboratory vs estimate",
-        subtitle=result.subtitle,
-        output_path=scatter_path,
-        metrics=result.metrics,
-    )
-
-    make_bland_altman_plot(
-        result.df,
-        result.y_true_col,
-        result.y_pred_col,
-        title=f"{result.title}: Bland-Altman agreement",
-        output_path=bland_path,
-        metrics=result.metrics,
-    )
-
-    make_residual_plot(
-        result.df,
-        result.y_true_col,
-        result.y_pred_col,
-        title=f"{result.title}: residual pattern",
-        output_path=residual_path,
-    )
-
-    return {
-        "scatter": scatter_path,
-        "bland_altman": bland_path,
-        "residual": residual_path,
-    }
-
-
-def interpret_metrics(metrics: dict, mode: str) -> list[str]:
+def interpret_metrics(metrics: dict, mode: str, model_name: str | None = None) -> list[str]:
     n = metrics.get("n", 0)
-    pearson = metrics.get("pearson_r", np.nan)
-    pearson_p = metrics.get("pearson_p", np.nan)
-    spearman = metrics.get("spearman_r", np.nan)
-    spearman_p = metrics.get("spearman_p", np.nan)
+    r = metrics.get("pearson_r", np.nan)
     bias = metrics.get("bias_mean_estimate_minus_lab", np.nan)
     mae = metrics.get("MAE", np.nan)
     rmse = metrics.get("RMSE", np.nan)
     r2 = metrics.get("R2_direct_prediction", np.nan)
-    ccc = metrics.get("CCC_agreement", np.nan)
-    lower = metrics.get("bland_altman_lower_95", np.nan)
-    upper = metrics.get("bland_altman_upper_95", np.nan)
-
-    comments: list[str] = []
-
-    comments.append(f"This comparison contains n = {n} matched samples.")
-
-    if n < 20:
-        comments.append(
-            "The sample size is small, so the result should be presented as preliminary "
-            "and sensitive to individual outliers."
-        )
-    elif n < 50:
-        comments.append(
-            "The sample size is moderate for exploration, but still limited for final validation."
-        )
-    else:
-        comments.append(
-            "The sample size is large enough for a more stable exploratory validation, "
-            "although independent validation is still recommended."
-        )
-
-    if np.isfinite(pearson):
-        if abs(pearson) >= 0.7:
-            strength = "strong"
-        elif abs(pearson) >= 0.5:
-            strength = "moderate"
-        elif abs(pearson) >= 0.3:
-            strength = "weak-to-moderate"
-        else:
-            strength = "weak"
-
-        comments.append(
-            f"The linear association is {strength}: Pearson r = {fmt(pearson)}, "
-            f"p = {fmt_p(pearson_p)}."
-        )
-
-    if np.isfinite(spearman):
-        if np.isfinite(pearson) and abs(spearman) > abs(pearson) + 0.1:
-            comments.append(
-                f"The rank association is stronger than the linear association: "
-                f"Spearman r = {fmt(spearman)}, p = {fmt_p(spearman_p)}. "
-                "This suggests that the method may rank samples better than it predicts "
-                "exact numeric values."
-            )
-        else:
-            comments.append(
-                f"The rank association is Spearman r = {fmt(spearman)}, "
-                f"p = {fmt_p(spearman_p)}."
-            )
-
+    comments = [f"This comparison contains n = {n} samples."]
+    if np.isfinite(r):
+        strength = "strong" if abs(r) >= .7 else "moderate" if abs(r) >= .5 else "weak-to-moderate" if abs(r) >= .3 else "weak"
+        comments.append(f"The linear association is {strength}: Pearson r = {fmt(r)}.")
     if np.isfinite(bias):
-        if bias > 0:
-            comments.append(f"The method overestimates laboratory orgC on average by {fmt(bias)} units.")
-        elif bias < 0:
-            comments.append(f"The method underestimates laboratory orgC on average by {fmt(abs(bias))} units.")
-        else:
-            comments.append("The mean bias is approximately zero.")
-
+        direction = "overestimates" if bias > 0 else "underestimates" if bias < 0 else "has approximately zero bias relative to"
+        amount = f" by {fmt(abs(bias))} units on average" if bias else ""
+        comments.append(f"The method {direction} laboratory orgC{amount}.")
     if np.isfinite(mae) and np.isfinite(rmse):
-        comments.append(f"The absolute error is MAE = {fmt(mae)} and RMSE = {fmt(rmse)}.")
-
-    if np.isfinite(ccc):
-        if ccc >= 0.75:
-            agreement = "good"
-        elif ccc >= 0.5:
-            agreement = "moderate"
-        elif ccc >= 0.25:
-            agreement = "limited"
-        else:
-            agreement = "poor"
-
-        comments.append(
-            f"Agreement is {agreement}: CCC = {fmt(ccc)}. CCC is stricter than "
-            "correlation because it also penalizes bias and scale differences."
-        )
-
+        comments.append(f"Prediction error is MAE = {fmt(mae)} and RMSE = {fmt(rmse)}.")
     if np.isfinite(r2):
         if r2 < 0:
-            comments.append(
-                f"The direct-prediction R² is negative ({fmt(r2)}), meaning direct "
-                "predictions are worse than simply using the mean laboratory value."
-            )
-        elif r2 < 0.25:
-            comments.append(
-                f"The direct-prediction R² is low ({fmt(r2)}), so this should not be "
-                "presented as a validated direct estimator."
-            )
-        elif r2 < 0.5:
-            comments.append(
-                f"The direct-prediction R² is moderate ({fmt(r2)}), suggesting useful "
-                "signal but still substantial unexplained variability."
-            )
+            comments.append(f"R² is negative ({fmt(r2)}), so predictions are worse than predicting the test-set mean.")
+        elif r2 < .25:
+            comments.append(f"R² is low ({fmt(r2)}); this is not yet a validated quantitative estimator.")
+        elif r2 < .5:
+            comments.append(f"R² is moderate ({fmt(r2)}), showing useful signal with substantial unexplained variability.")
         else:
-            comments.append(
-                f"The direct-prediction R² is relatively strong ({fmt(r2)}), although "
-                "independent validation is still needed."
-            )
-
-    if np.isfinite(lower) and np.isfinite(upper):
+            comments.append(f"R² is relatively strong ({fmt(r2)}), although further independent validation remains appropriate.")
+    if mode == "final_test":
         comments.append(
-            f"The Bland-Altman 95% limits of agreement are {fmt(lower)} to {fmt(upper)}, "
-            "showing the likely range of individual errors."
+            f"Model {model_name!r} was selected by repeated cross-validation on development data. "
+            "The values shown here come from the untouched final test set."
         )
-
-    if mode == "trained":
-        comments.append(
-            "This section uses cross-validated predictions, so each sample is predicted "
-            "by a model that was not trained on that same sample."
-        )
-    elif mode == "gray_no_training":
-        comments.append(
-            "No training is applied in this section because the current grey-scale subset "
-            "is too small. The purpose is to show whether a useful signal is already visible."
-        )
+    elif mode == "direct_gray":
+        comments.append("This is a direct formula-based SOC estimate, not a trained prediction model.")
     elif mode == "citizen":
-        comments.append(
-            "This section is useful as a baseline comparison against the citizen-science estimate."
-        )
-
+        comments.append("Citizen estimates are an external baseline and do not participate in image-model selection.")
     return comments
 
 
-def build_citizen_comparison(
-    lab_df: pd.DataFrame,
-    lab_col: str,
-    citizen_col: str,
-) -> ComparisonResult | None:
-    if lab_col not in lab_df.columns or citizen_col not in lab_df.columns:
+def build_citizen_comparison(lab: pd.DataFrame, lab_col: str, citizen_col: str) -> ComparisonResult | None:
+    if lab_col not in lab.columns or citizen_col not in lab.columns:
         return None
-
-    df = clean_pair_df(lab_df, lab_col, citizen_col)
-
-    if len(df) == 0:
+    df = clean_pair_df(lab, lab_col, citizen_col)
+    if df.empty:
         return None
-
-    metrics = compute_metrics(
-        df[lab_col].to_numpy(dtype=float),
-        df[citizen_col].to_numpy(dtype=float),
-    )
-
+    metrics = compute_metrics(df[lab_col], df[citizen_col])
     return ComparisonResult(
-        key="citizen",
-        title="Lab vs citizen results",
-        subtitle="Citizen estimate",
-        df=df,
-        y_true_col=lab_col,
-        y_pred_col=citizen_col,
-        method_note=(
-            "Direct comparison between laboratory organic carbon and the citizen-science "
-            "organic carbon estimate."
-        ),
-        metrics=metrics,
-        figures={},
-        interpretation=interpret_metrics(metrics, mode="citizen"),
+        "citizen_baseline", "Laboratory vs citizen-science estimate", "Citizen-science orgC estimate",
+        df, lab_col, citizen_col,
+        "External baseline only; it is not used to train or select image models.",
+        metrics, interpret_metrics(metrics, "citizen")
     )
 
 
-def build_no_gray_trained_comparison(
-    no_gray_df: pd.DataFrame,
-    lab_col: str,
-    feature_cols: list[str],
-) -> tuple[ComparisonResult | None, dict | None]:
-    df = filter_processing_ok(no_gray_df)
-
-    missing = [c for c in [lab_col] + feature_cols if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"No-gray table is missing columns required for training: {missing}"
-        )
-
-    trained_df, model_info = train_cv_predictions(
-        df,
-        target_col=lab_col,
-        feature_cols=feature_cols,
-        prediction_col="predicted_orgC_cv_no_gray",
-    )
-
-    metrics = compute_metrics(
-        trained_df[lab_col].to_numpy(dtype=float),
-        trained_df["predicted_orgC_cv_no_gray"].to_numpy(dtype=float),
-    )
-
-    result = ComparisonResult(
-        key="no_gray_trained",
-        title="Lab vs no-grey-scale algorithm",
-        subtitle="Cross-validated calibrated prediction",
-        df=trained_df,
-        y_true_col=lab_col,
-        y_pred_col="predicted_orgC_cv_no_gray",
-        method_note=(
-            "The no-grey-scale image features are calibrated using a linear model with "
-            "cross-validation. By default the model is: lab orgC ~ L + a + b."
-        ),
-        metrics=metrics,
-        figures={},
-        interpretation=interpret_metrics(metrics, mode="trained"),
-    )
-
-    return result, model_info
-
-
-def build_with_gray_direct_comparison(
-    with_gray_df: pd.DataFrame,
-    lab_col: str,
-    estimate_col: str,
-) -> ComparisonResult | None:
-    df = filter_processing_ok(with_gray_df)
-
+def build_direct_gray_comparison(df: pd.DataFrame, lab_col: str, estimate_col: str) -> ComparisonResult | None:
+    df = filter_processing_ok(df)
     if lab_col not in df.columns or estimate_col not in df.columns:
-        raise ValueError(
-            f"With-gray table must contain columns {lab_col!r} and {estimate_col!r}."
-        )
-
-    df = clean_pair_df(df, lab_col, estimate_col)
-
-    if len(df) == 0:
         return None
-
-    metrics = compute_metrics(
-        df[lab_col].to_numpy(dtype=float),
-        df[estimate_col].to_numpy(dtype=float),
-    )
-
+    df = clean_pair_df(df, lab_col, estimate_col)
+    if df.empty:
+        return None
+    metrics = compute_metrics(df[lab_col], df[estimate_col])
     return ComparisonResult(
-        key="with_gray_direct",
-        title="Lab vs grey-scale algorithm",
-        subtitle="Direct grey-corrected algorithm estimate",
-        df=df,
-        y_true_col=lab_col,
-        y_pred_col=estimate_col,
-        method_note=(
-            "Direct comparison between laboratory organic carbon and the grey-scale-corrected "
-            "algorithm estimate. No training is applied because the current grey-scale dataset "
-            "is still too small."
-        ),
-        metrics=metrics,
-        figures={},
-        interpretation=interpret_metrics(metrics, mode="gray_no_training"),
+        "direct_gray_heuristic", "Laboratory vs direct grey-corrected SOC heuristic",
+        "Direct formula-based SOC estimate", df, lab_col, estimate_col,
+        "Formula-based estimate after grey-scale correction; no supervised training is involved.",
+        metrics, interpret_metrics(metrics, "direct_gray")
     )
 
 
-def metrics_to_summary_row(result: ComparisonResult) -> dict:
-    row = {"scenario": result.title}
-    row.update(result.metrics)
-    row["method_note"] = result.method_note
-    return row
-
-
-def relative_figure_path(path: Path, out_dir: Path) -> str:
-    return path.relative_to(out_dir).as_posix()
-
-
-def html_metric_table(summary_df: pd.DataFrame) -> str:
-    columns = [
-        "scenario",
-        "n",
-        "lab_mean",
-        "lab_sd",
-        "estimate_mean",
-        "estimate_sd",
-        "pearson_r",
-        "pearson_p",
-        "spearman_r",
-        "spearman_p",
-        "CCC_agreement",
-        "bias_mean_estimate_minus_lab",
-        "MAE",
-        "RMSE",
-        "R2_direct_prediction",
-        "bland_altman_lower_95",
-        "bland_altman_upper_95",
-        "R2_calibration_regression",
-    ]
-
-    existing = [c for c in columns if c in summary_df.columns]
-    headers = "".join(f"<th>{html.escape(c)}</th>" for c in existing)
-
-    rows = []
-    for _, row in summary_df.iterrows():
-        cells = []
-
-        for col in existing:
-            value = row[col]
-
-            if col == "scenario":
-                cells.append(f"<td>{html.escape(str(value))}</td>")
-            elif col == "n":
-                cells.append(f"<td>{int(value) if pd.notna(value) else 'NA'}</td>")
-            elif col.endswith("_p"):
-                cells.append(f"<td>{fmt_p(value)}</td>")
-            else:
-                cells.append(f"<td>{fmt(value)}</td>")
-
-        rows.append("<tr>" + "".join(cells) + "</tr>")
-
-    return f"""
-<table>
-  <thead>
-    <tr>{headers}</tr>
-  </thead>
-  <tbody>
-    {''.join(rows)}
-  </tbody>
-</table>
-"""
-
-
-def html_model_info(model_info: dict | None) -> str:
-    if not model_info:
-        return ""
-
-    coef = model_info.get("coefficients_original_units", {})
-    rows = []
-
-    rows.append(
-        "<tr><td>Training rows</td>"
-        f"<td>{html.escape(str(model_info.get('n_training_rows')))}</td></tr>"
+def build_selected_model_comparison(summary: pd.DataFrame, predictions: pd.DataFrame) -> tuple[ComparisonResult, pd.Series]:
+    selected = select_best_model_by_cv(summary)
+    model_name = str(selected["model"])
+    df = predictions[predictions["model"].astype(str).eq(model_name)].copy()
+    if df.empty:
+        raise ValueError(f"No final-test predictions found for selected model {model_name!r}.")
+    df["lab_value"] = pd.to_numeric(df["lab_value"], errors="coerce")
+    df["predicted_value"] = pd.to_numeric(df["predicted_value"], errors="coerce")
+    df = df.dropna(subset=["lab_value", "predicted_value"])
+    metrics = compute_metrics(df["lab_value"], df["predicted_value"])
+    result = ComparisonResult(
+        f"selected_model_{model_name}", f"Held-out final test: {model_name}",
+        "Predicted laboratory orgC", df, "lab_value", "predicted_value",
+        "Selected solely by the lowest repeated-CV RMSE among non-baseline models; test metrics were not used for selection.",
+        metrics, interpret_metrics(metrics, "final_test", model_name)
     )
-    rows.append(
-        "<tr><td>Cross-validation</td>"
-        f"<td>{html.escape(str(model_info.get('cv')))}</td></tr>"
-    )
-    rows.append(
-        "<tr><td>Features</td>"
-        f"<td>{html.escape(', '.join(model_info.get('features', [])))}</td></tr>"
-    )
-    rows.append(
-        "<tr><td>Intercept</td>"
-        f"<td>{fmt(model_info.get('intercept_original_units'))}</td></tr>"
-    )
-
-    for name, value in coef.items():
-        rows.append(
-            f"<tr><td>Coefficient: {html.escape(name)}</td><td>{fmt(value)}</td></tr>"
-        )
-
-    return f"""
-<section class="section-card">
-  <h2>Training model used for the no-grey-scale section</h2>
-  <table>
-    <tbody>
-      {''.join(rows)}
-    </tbody>
-  </table>
-</section>
-"""
+    return result, selected
 
 
-def render_html_report(
-    results: list[ComparisonResult],
-    summary_df: pd.DataFrame,
-    out_dir: Path,
-    model_info: dict | None,
-    title: str,
-    qc_examples_html: str = "",
-    mae_rmse_html: str = "",
-) -> None:
-    figures_dir = out_dir / "figures"
-    summary_chart = figures_dir / "method_error_comparison.png"
+def make_scatter(result: ComparisonResult, path: Path) -> None:
+    x = result.df[result.y_true_col].to_numpy(float)
+    y = result.df[result.y_pred_col].to_numpy(float)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(x, y, alpha=.8)
+    low, high = min(x.min(), y.min()), max(x.max(), y.max())
+    pad = (high - low) * .08 if high > low else 1
+    ax.plot([low-pad, high+pad], [low-pad, high+pad], "--")
+    ax.set(xlabel="Laboratory orgC", ylabel=result.subtitle, title=f"{result.title}: laboratory vs estimate")
+    ax.grid(alpha=.25)
+    label = f"n={result.metrics['n']}\nr={fmt(result.metrics['pearson_r'])}\nMAE={fmt(result.metrics['MAE'])}\nRMSE={fmt(result.metrics['RMSE'])}\nR²={fmt(result.metrics['R2_direct_prediction'])}"
+    ax.text(.04, .96, label, transform=ax.transAxes, va="top", bbox={"boxstyle":"round", "alpha":.15})
+    fig.tight_layout(); fig.savefig(path, dpi=180); plt.close(fig)
 
-    if len(summary_df) > 0:
-        make_metrics_bar_plot(summary_df, summary_chart)
 
-    cards = []
+def make_bland_altman(result: ComparisonResult, path: Path) -> None:
+    true = result.df[result.y_true_col].to_numpy(float)
+    pred = result.df[result.y_pred_col].to_numpy(float)
+    means, residual = (true + pred) / 2, pred - true
+    fig, ax = plt.subplots(figsize=(7, 5.5)); ax.scatter(means, residual, alpha=.8)
+    for value, style, label in [
+        (result.metrics["bias_mean_estimate_minus_lab"], "-", "Bias"),
+        (result.metrics["bland_altman_lower_95"], "--", "Lower 95%"),
+        (result.metrics["bland_altman_upper_95"], "--", "Upper 95%")]:
+        if np.isfinite(value): ax.axhline(value, linestyle=style, label=f"{label}={fmt(value)}")
+    ax.axhline(0, linestyle=":", label="Zero error")
+    ax.set(xlabel="Mean of laboratory and estimate", ylabel="Estimate minus laboratory", title=f"{result.title}: Bland-Altman")
+    ax.grid(alpha=.25); ax.legend(fontsize=8); fig.tight_layout(); fig.savefig(path, dpi=180); plt.close(fig)
 
-    for result in results:
-        fig_scatter = relative_figure_path(result.figures["scatter"], out_dir)
-        fig_ba = relative_figure_path(result.figures["bland_altman"], out_dir)
-        fig_residual = relative_figure_path(result.figures["residual"], out_dir)
 
-        interpretation_items = "\n".join(
-            f"<li>{html.escape(item)}</li>" for item in result.interpretation
-        )
+def make_residual(result: ComparisonResult, path: Path) -> None:
+    true = result.df[result.y_true_col].to_numpy(float)
+    residual = result.df[result.y_pred_col].to_numpy(float) - true
+    fig, ax = plt.subplots(figsize=(7, 5.5)); ax.scatter(true, residual, alpha=.8); ax.axhline(0, linestyle=":")
+    ax.set(xlabel="Laboratory orgC", ylabel="Estimate minus laboratory", title=f"{result.title}: residuals")
+    ax.grid(alpha=.25); fig.tight_layout(); fig.savefig(path, dpi=180); plt.close(fig)
 
-        cards.append(
-            f"""
-<section class="section-card" id="{html.escape(slugify(result.key))}">
-  <h2>{html.escape(result.title)}</h2>
 
-  <p class="method-note">{html.escape(result.method_note)}</p>
-
-  <div class="metric-strip">
-    <div><span>n</span><strong>{fmt(result.metrics.get("n"), 0)}</strong></div>
-    <div><span>Pearson r</span><strong>{fmt(result.metrics.get("pearson_r"))}</strong></div>
-    <div><span>Spearman r</span><strong>{fmt(result.metrics.get("spearman_r"))}</strong></div>
-    <div><span>Bias</span><strong>{fmt(result.metrics.get("bias_mean_estimate_minus_lab"))}</strong></div>
-    <div><span>MAE</span><strong>{fmt(result.metrics.get("MAE"))}</strong></div>
-    <div><span>RMSE</span><strong>{fmt(result.metrics.get("RMSE"))}</strong></div>
-    <div><span>R²</span><strong>{fmt(result.metrics.get("R2_direct_prediction"))}</strong></div>
-  </div>
-
-  <h3>Commentary</h3>
-  <ul>
-    {interpretation_items}
-  </ul>
-
-  <div class="figure-grid">
-    <figure>
-      <img src="{html.escape(fig_scatter)}" alt="Scatter plot">
-      <figcaption>
-        Laboratory value against the estimate. The dashed line is the 1:1 line.
-      </figcaption>
-    </figure>
-
-    <figure>
-      <img src="{html.escape(fig_ba)}" alt="Bland-Altman plot">
-      <figcaption>
-        Agreement plot. The y-axis is estimate minus laboratory value.
-      </figcaption>
-    </figure>
-
-    <figure>
-      <img src="{html.escape(fig_residual)}" alt="Residual plot">
-      <figcaption>
-        Error pattern against laboratory orgC.
-      </figcaption>
-    </figure>
-  </div>
-</section>
-"""
-        )
-
-    summary_chart_html = ""
-    if summary_chart.exists():
-        summary_chart_html = f"""
-<figure>
-  <img src="{html.escape(relative_figure_path(summary_chart, out_dir))}" alt="Method error comparison">
-  <figcaption>MAE and RMSE comparison across the available methods.</figcaption>
-</figure>
-"""
-
-    html_text = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{html.escape(title)}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-
-  <style>
-    body {{
-      margin: 0;
-      font-family: Arial, Helvetica, sans-serif;
-      color: #1f2933;
-      background: #f5f7fa;
-      line-height: 1.5;
-    }}
-
-    header {{
-      background: #111827;
-      color: white;
-      padding: 32px 40px;
-    }}
-
-    header h1 {{
-      margin: 0 0 8px 0;
-      font-size: 30px;
-    }}
-
-    header p {{
-      margin: 0;
-      max-width: 980px;
-      color: #d1d5db;
-    }}
-
-    main {{
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 28px 20px 60px 20px;
-    }}
-
-    .section-card {{
-      background: white;
-      border-radius: 14px;
-      padding: 26px;
-      margin-bottom: 28px;
-      box-shadow: 0 2px 14px rgba(15, 23, 42, 0.08);
-    }}
-
-    h2 {{
-      margin-top: 0;
-      color: #111827;
-    }}
-
-    h3 {{
-      margin-top: 24px;
-      color: #1f2937;
-    }}
-
-    .method-note {{
-      color: #4b5563;
-      margin-bottom: 18px;
-    }}
-
-    .metric-strip {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 12px;
-      margin: 18px 0;
-    }}
-
-    .metric-strip div {{
-      background: #f3f4f6;
-      border-radius: 10px;
-      padding: 12px;
-    }}
-
-    .metric-strip span {{
-      display: block;
-      font-size: 12px;
-      color: #6b7280;
-      margin-bottom: 4px;
-    }}
-
-    .metric-strip strong {{
-      font-size: 20px;
-      color: #111827;
-    }}
-
-    .figure-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
-      gap: 18px;
-      margin-top: 16px;
-    }}
-
-    figure {{
-      margin: 0;
-      background: #f9fafb;
-      border: 1px solid #e5e7eb;
-      border-radius: 12px;
-      padding: 12px;
-    }}
-
-    figure img {{
-      width: 100%;
-      display: block;
-      border-radius: 8px;
-      background: white;
-    }}
-
-    figcaption {{
-      font-size: 13px;
-      color: #4b5563;
-      margin-top: 8px;
-    }}
-
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-      overflow-x: auto;
-      display: block;
-    }}
-
-    th,
-    td {{
-      border: 1px solid #e5e7eb;
-      padding: 8px 10px;
-      text-align: right;
-      white-space: nowrap;
-    }}
-
-    th:first-child,
-    td:first-child {{
-      text-align: left;
-    }}
-
-    th {{
-      background: #f3f4f6;
-      color: #374151;
-    }}
-
-    ul {{
-      padding-left: 22px;
-    }}
-
-    code {{
-      background: #f3f4f6;
-      padding: 2px 5px;
-      border-radius: 4px;
-    }}
-
-    .warning {{
-      background: #fff7ed;
-      border: 1px solid #fed7aa;
-      border-radius: 12px;
-      padding: 14px 16px;
-      color: #7c2d12;
-    }}
-
-    .qc-sample-card {{
-      background: #ffffff;
-      border: 1px solid #e5e7eb;
-      border-radius: 12px;
-      padding: 18px;
-      margin-top: 22px;
-    }}
-
-    .qc-sample-card h3 {{
-      margin-top: 0;
-      color: #111827;
-    }}
-
-    .qc-sample-card h4 {{
-      margin-top: 22px;
-      margin-bottom: 10px;
-      color: #374151;
-    }}
-
-    .missing-asset {{
-      background: #fef2f2;
-      border-color: #fecaca;
-    }}
-
-    .missing-box {{
-      height: 220px;
-      border-radius: 8px;
-      background: repeating-linear-gradient(
-        45deg,
-        #fee2e2,
-        #fee2e2 10px,
-        #fecaca 10px,
-        #fecaca 20px
-      );
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #991b1b;
-      font-weight: bold;
-    }}
-  </style>
-</head>
-
-<body>
-  <header>
-    <h1>{html.escape(title)}</h1>
-    <p>
-      Automated presentation report comparing laboratory organic carbon results with
-      citizen-science estimates and image-based soil colour algorithms.
-    </p>
-  </header>
-
-  <main>
-    <section class="section-card">
-      <h2>Executive summary</h2>
-
-      <p>This report separates three questions:</p>
-
-      <ol>
-        <li>How do citizen-science organic carbon estimates compare with laboratory results?</li>
-        <li>How well can non-grey-scale image results be calibrated against laboratory results?</li>
-        <li>Do grey-scale-corrected image results already show a useful signal, even before training?</li>
-      </ol>
-
-      <div class="warning">
-        The grey-scale subset should be presented as preliminary if the number of matched
-        samples is still small. The appropriate conclusion is not final validation, but whether
-        the colour signal is promising enough to continue collecting the planned 100-200
-        grey-scale samples.
-      </div>
-    </section>
-
-    <section class="section-card">
-      <h2>Metrics overview</h2>
-      {html_metric_table(summary_df)}
-
-      <h3>Error comparison</h3>
-      {summary_chart_html}
-    </section>
-
-    {html_model_info(model_info)}
-
-        {''.join(cards)}
-
-        {mae_rmse_html}
-
-        {qc_examples_html}
-
-        <section class="section-card">
-        <h2>How to present the current status</h2>
-
-      <p>The safest scientific interpretation is:</p>
-
-      <ul>
-        <li>
-          Citizen estimates provide a useful baseline for comparison, but the level of agreement
-          with laboratory results must be assessed directly.
-        </li>
-        <li>
-          The no-grey-scale algorithm should be presented using cross-validated calibrated
-          predictions, not only training-set performance.
-        </li>
-        <li>
-          The grey-scale algorithm should currently be presented as a preliminary direct
-          comparison. If it shows stronger correlation but still weak agreement, it should be
-          described as a promising calibration signal, not as a validated direct estimator.
-        </li>
-        <li>
-          Once 100-200 grey-scale samples are available, the same report can be rerun and the
-          grey-scale section can be changed from direct comparison to trained cross-validated
-          calibration.
-        </li>
-      </ul>
-    </section>
-  </main>
-</body>
-</html>
-"""
-
-    (out_dir / "index.html").write_text(html_text, encoding="utf-8")
+def create_figures(result: ComparisonResult, directory: Path) -> dict:
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = slugify(result.key)
+    paths = {k: directory / f"{stem}_{k}.png" for k in ["scatter", "bland_altman", "residual"]}
+    make_scatter(result, paths["scatter"]); make_bland_altman(result, paths["bland_altman"]); make_residual(result, paths["residual"])
+    return paths
 
 
 def write_predictions(result: ComparisonResult, out_dir: Path) -> None:
-    output_path = out_dir / f"{slugify(result.key)}_predictions.csv"
+    columns = [c for c in ["ID", "SampleCode", "sample_code_base", "image", "model"] if c in result.df.columns]
+    columns += [result.y_true_col, result.y_pred_col]
+    output = result.df[list(dict.fromkeys(columns))].copy()
+    output["error_estimate_minus_lab"] = output[result.y_pred_col] - output[result.y_true_col]
+    output["absolute_error"] = output["error_estimate_minus_lab"].abs()
+    output.to_csv(out_dir / f"{slugify(result.key)}_predictions.csv", index=False)
 
-    cols = []
 
-    for col in ["ID", "SampleCode", "sample_code_base", "image"]:
-        if col in result.df.columns:
-            cols.append(col)
+def extract_sample_code(value) -> str | None:
+    if value is None or pd.isna(value): return None
+    match = re.search(r"[A-Za-z]{4}", Path(str(value).strip()).stem)
+    return match.group(0).upper() if match else None
 
-    cols += [result.y_true_col, result.y_pred_col]
-    cols = list(dict.fromkeys(cols))
 
-    df = result.df[cols].copy()
-    df["error_estimate_minus_lab"] = df[result.y_pred_col] - df[result.y_true_col]
-    df["absolute_error"] = df["error_estimate_minus_lab"].abs()
-    df.to_csv(output_path, index=False)
+def collect_qc_codes(explicit: list[str] | None, df: pd.DataFrame, maximum: int) -> list[str]:
+    codes: list[str] = []
+    values = explicit or []
+    if not explicit:
+        for col in ["sample_code_base", "SampleCode", "ID", "image"]:
+            if col in df.columns:
+                values = df[col].dropna().tolist(); break
+    for value in values:
+        code = extract_sample_code(value)
+        if code and code not in codes: codes.append(code)
+        if len(codes) >= maximum: break
+    return codes
+
+
+def find_ci(directory: Path, filename: str) -> Path | None:
+    direct = directory / filename
+    if direct.exists(): return direct
+    if not directory.exists(): return None
+    target = filename.lower()
+    return next((p for p in directory.iterdir() if p.is_file() and p.name.lower() == target), None)
+
+
+def copy_asset(source: Path | None, out_dir: Path, subdir: str, name: str) -> str | None:
+    if source is None or not source.exists(): return None
+    target_dir = out_dir / subdir; target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / name; shutil.copy2(source, target)
+    return target.relative_to(out_dir).as_posix()
+
+
+def image_html(title: str, relative: str | None, caption: str, missing: str) -> str:
+    if relative:
+        return f'<figure><img src="{html.escape(relative)}" alt="{html.escape(title)}"><figcaption><strong>{html.escape(title)}.</strong> {html.escape(caption)}</figcaption></figure>'
+    return f'<figure class="missing-asset"><div class="missing-box">Missing image</div><figcaption><strong>{html.escape(title)}.</strong> {html.escape(missing)}</figcaption></figure>'
+
+
+def build_qc_html(out_dir: Path, codes: list[str], masks: Path, gray: Path, cards: Path) -> str:
+    if not codes:
+        return '<section class="section-card"><h2>Image-processing QC</h2><p>No QC codes selected.</p></section>'
+    sections = []
+    for code in codes:
+        assets = {
+            "soil": copy_asset(find_ci(masks, f"{code}_roi_rect.jpg"), out_dir, "assets/qc/masks", f"{code}_roi_rect.jpg"),
+            "grayrect": copy_asset(find_ci(gray, f"{code}_gray_roi_rect.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_roi_rect.jpg"),
+            "grayroi": copy_asset(find_ci(gray, f"{code}_gray_roi.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_roi.jpg"),
+            "beforeafter": copy_asset(find_ci(gray, f"{code}_gray_before_after.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_before_after.jpg"),
+            "card": copy_asset(find_ci(cards, f"{code}_comparison.jpg"), out_dir, "assets/qc/cards", f"{code}_comparison.jpg"),
+        }
+        sections.append(f'''<section class="qc-sample-card"><h3>Sample {html.escape(code)}</h3>
+        <div class="figure-grid">
+        {image_html("Soil ROI", assets["soil"], "The rectangle should contain representative soil only.", str(masks / f"{code}_roi_rect.jpg"))}
+        {image_html("Detected grey-scale rectangle", assets["grayrect"], "The rectangle should surround the full 11-patch scale.", str(gray / f"{code}_gray_roi_rect.jpg"))}
+        {image_html("Extracted grey-scale ROI", assets["grayroi"], "The crop should contain the darkest-to-lightest patches with little paper or text.", str(gray / f"{code}_gray_roi.jpg"))}
+        {image_html("Before/after correction", assets["beforeafter"], "Correction should neutralise colour cast without clipping or distortion.", str(gray / f"{code}_gray_before_after.jpg"))}
+        {image_html("Colour/Munsell card", assets["card"], "Visual check of ROI colour, Lab estimate, closest Munsell chip, and direct SOC heuristic.", str(cards / f"{code}_comparison.jpg"))}
+        </div></section>''')
+    return '<section class="section-card"><h2>Image-processing quality control</h2><p>These examples verify that grey-scale detection and soil colour extraction are visually plausible.</p>' + ''.join(sections) + '</section>'
+
+def metrics_summary_row(result: ComparisonResult) -> dict:
+    row = {"scenario": result.title, **result.metrics, "method_note": result.method_note}
+    return row
+
+
+def html_table(df: pd.DataFrame, columns: list[str], selected_model: str | None = None) -> str:
+    columns = [c for c in columns if c in df.columns]
+    head = ''.join(f'<th>{html.escape(c)}</th>' for c in columns)
+    body = []
+    for _, row in df.iterrows():
+        is_selected = selected_model is not None and str(row.get("model")) == selected_model
+        cells = []
+        for col in columns:
+            value = row[col]
+            if col in {"scenario", "model", "features", "SampleCode", "ID", "image", "interpretation"}:
+                text = html.escape(str(value))
+                if col == "model" and is_selected: text += " <strong>(selected by CV)</strong>"
+            elif col in {"n", "train_n", "test_n"}:
+                text = str(int(value)) if pd.notna(value) else "NA"
+            else:
+                text = fmt(value)
+            cells.append(f'<td>{text}</td>')
+        klass = ' class="selected-row"' if is_selected else ''
+        body.append(f'<tr{klass}>' + ''.join(cells) + '</tr>')
+    return f'<table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table>'
+
+
+def build_experiment_html(summary: pd.DataFrame, split: pd.DataFrame, selected: pd.Series) -> str:
+    model = str(selected["model"])
+    counts = split["split"].astype(str).str.lower().value_counts() if "split" in split.columns else pd.Series(dtype=int)
+    train_n, test_n = int(counts.get("train", 0)), int(counts.get("test", 0))
+
+    baseline = summary[summary["model"].astype(str).eq("baseline_mean")]
+    if not baseline.empty:
+        gain = float(baseline.iloc[0]["test_RMSE"]) - float(selected["test_RMSE"])
+        baseline_text = (
+            f"The selected model improves held-out RMSE over the mean baseline by {fmt(gain)} orgC units."
+            if gain > 0 else
+            f"The selected model does not improve on the mean baseline; RMSE difference is {fmt(gain)}."
+        )
+    else:
+        baseline_text = "No mean-prediction baseline row was available."
+
+    munsell = summary[summary["model"].astype(str).eq("model_4_Munsell_interpolated")]
+    if not munsell.empty:
+        difference = float(munsell.iloc[0]["cv_RMSE_mean"]) - float(selected["cv_RMSE_mean"])
+        if abs(difference) < 1e-12:
+            munsell_text = "The interpolated-Munsell model ties the selected model on mean CV RMSE."
+        elif difference > 0:
+            munsell_text = f"The interpolated-Munsell model has {fmt(difference)} higher mean CV RMSE than the selected model."
+        else:
+            munsell_text = f"The interpolated-Munsell model has {fmt(abs(difference))} lower mean CV RMSE; review the selection output."
+    else:
+        munsell_text = "No interpolated-Munsell model row was found."
+
+    ordered = summary.copy()
+    ordered["cv_RMSE_mean"] = pd.to_numeric(ordered["cv_RMSE_mean"], errors="coerce")
+    ordered = ordered.sort_values(["cv_RMSE_mean", "model"], na_position="last")
+    columns = ["model", "features", "train_n", "test_n", "cv_RMSE_mean", "cv_RMSE_sd", "cv_MAE_mean", "cv_MAE_sd", "cv_R2_mean", "test_RMSE", "test_MAE", "test_bias_pred_minus_lab", "test_R2", "test_pearson_r"]
+
+    return f'''<section class="section-card"><h2>Grey-scale model experiment</h2>
+    <p>The shared experiment contains <strong>{train_n + test_n}</strong> usable grey-scale samples: <strong>{train_n}</strong> development samples and <strong>{test_n}</strong> untouched final-test samples.</p>
+    <p>Models are selected by repeated five-fold cross-validation on development data. Final-test metrics are not used for selection.</p>
+    <div class="metric-strip">
+      <div><span>Selected model</span><strong>{html.escape(model)}</strong></div>
+      <div><span>CV RMSE</span><strong>{fmt(selected.get("cv_RMSE_mean"))}</strong></div>
+      <div><span>CV MAE</span><strong>{fmt(selected.get("cv_MAE_mean"))}</strong></div>
+      <div><span>Test RMSE</span><strong>{fmt(selected.get("test_RMSE"))}</strong></div>
+      <div><span>Test MAE</span><strong>{fmt(selected.get("test_MAE"))}</strong></div>
+      <div><span>Test R²</span><strong>{fmt(selected.get("test_R2"))}</strong></div>
+    </div>
+    <div class="info-box"><p>{html.escape(baseline_text)}</p><p>{html.escape(munsell_text)}</p></div>
+    <h3>All candidate models</h3>{html_table(ordered, columns, model)}</section>'''
+
+
+def build_worst_errors_html(predictions: pd.DataFrame, model: str, count: int) -> str:
+    df = predictions[predictions["model"].astype(str).eq(model)].copy()
+    if df.empty: return ""
+    df["lab_value"] = pd.to_numeric(df["lab_value"], errors="coerce")
+    df["predicted_value"] = pd.to_numeric(df["predicted_value"], errors="coerce")
+    df = df.dropna(subset=["lab_value", "predicted_value"])
+    df["residual"] = df["predicted_value"] - df["lab_value"]
+    df["absolute_error"] = df["residual"].abs()
+    df = df.nlargest(count, "absolute_error")
+    columns = ["SampleCode", "ID", "image", "lab_value", "predicted_value", "residual", "absolute_error"]
+    return f'<section class="section-card"><h2>Largest final-test errors</h2><p>These cases should be prioritised for image-QC review and investigation of non-colour soil factors.</p>{html_table(df, columns)}</section>'
+
+
+def make_error_bar(summary: pd.DataFrame, path: Path) -> None:
+    df = summary.dropna(subset=["MAE", "RMSE"]).copy()
+    if df.empty: return
+    x = np.arange(len(df)); width = .35
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.bar(x-width/2, df["MAE"].astype(float), width, label="MAE")
+    ax.bar(x+width/2, df["RMSE"].astype(float), width, label="RMSE")
+    ax.set_xticks(x); ax.set_xticklabels(df["scenario"], rotation=20, ha="right")
+    ax.set_ylabel("orgC error"); ax.set_title("Error comparison"); ax.grid(axis="y", alpha=.25); ax.legend()
+    fig.tight_layout(); fig.savefig(path, dpi=180); plt.close(fig)
+
+
+def build_mae_rmse_html(summary: pd.DataFrame) -> str:
+    rows = []
+    for _, row in summary.iterrows():
+        mae, rmse = float(row["MAE"]), float(row["RMSE"])
+        ratio = rmse / mae if mae > 0 else np.nan
+        note = "Large errors are influential." if ratio > 1.5 else "Some larger errors are present." if ratio > 1.2 else "Error sizes are relatively even."
+        rows.append({"scenario": row["scenario"], "MAE": mae, "RMSE": rmse, "RMSE_MAE_ratio": ratio, "interpretation": note})
+    return f'<section class="section-card"><h2>How to interpret MAE and RMSE</h2><p>MAE is average absolute error; RMSE penalises large errors more strongly. Lower is better. Comparisons are most meaningful on the same sample set.</p>{html_table(pd.DataFrame(rows), ["scenario", "MAE", "RMSE", "RMSE_MAE_ratio", "interpretation"])}</section>'
+
+
+def result_card(result: ComparisonResult, out_dir: Path) -> str:
+    figures = result.figures or {}
+    rel = {k: figures[k].relative_to(out_dir).as_posix() for k in figures}
+    comments = ''.join(f'<li>{html.escape(c)}</li>' for c in result.interpretation)
+    return f'''<section class="section-card" id="{slugify(result.key)}"><h2>{html.escape(result.title)}</h2>
+    <p class="method-note">{html.escape(result.method_note)}</p>
+    <div class="metric-strip">
+      <div><span>n</span><strong>{fmt(result.metrics["n"], 0)}</strong></div>
+      <div><span>Pearson r</span><strong>{fmt(result.metrics["pearson_r"])}</strong></div>
+      <div><span>CCC</span><strong>{fmt(result.metrics["CCC_agreement"])}</strong></div>
+      <div><span>Bias</span><strong>{fmt(result.metrics["bias_mean_estimate_minus_lab"])}</strong></div>
+      <div><span>MAE</span><strong>{fmt(result.metrics["MAE"])}</strong></div>
+      <div><span>RMSE</span><strong>{fmt(result.metrics["RMSE"])}</strong></div>
+      <div><span>R²</span><strong>{fmt(result.metrics["R2_direct_prediction"])}</strong></div>
+    </div><h3>Commentary</h3><ul>{comments}</ul>
+    <div class="figure-grid">
+      <figure><img src="{rel["scatter"]}"><figcaption>Laboratory value against estimate; dashed line is 1:1.</figcaption></figure>
+      <figure><img src="{rel["bland_altman"]}"><figcaption>Agreement plot; y-axis is estimate minus laboratory.</figcaption></figure>
+      <figure><img src="{rel["residual"]}"><figcaption>Residual pattern against laboratory orgC.</figcaption></figure>
+    </div></section>'''
+
+def render_report(
+    out_dir: Path,
+    title: str,
+    results: list[ComparisonResult],
+    summary: pd.DataFrame,
+    experiment_html: str,
+    worst_html: str,
+    qc_html: str,
+) -> None:
+    error_chart = out_dir / "figures" / "method_error_comparison.png"
+    make_error_bar(summary, error_chart)
+    chart_html = f'<figure><img src="{error_chart.relative_to(out_dir).as_posix()}"><figcaption>MAE and RMSE for the citizen baseline, direct grey-corrected heuristic, and selected held-out model. Consult n because sample sets may differ.</figcaption></figure>' if error_chart.exists() else ""
+    cards = ''.join(result_card(r, out_dir) for r in results)
+    overview = html_table(summary, ["scenario", "n", "pearson_r", "CCC_agreement", "bias_mean_estimate_minus_lab", "MAE", "RMSE", "R2_direct_prediction", "bland_altman_lower_95", "bland_altman_upper_95"])
+    mae_html = build_mae_rmse_html(summary)
+
+    document = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{html.escape(title)}</title>
+<style>
+body{{margin:0;font-family:Arial,Helvetica,sans-serif;color:#1f2933;background:#f5f7fa;line-height:1.5}}
+header{{background:#111827;color:white;padding:32px 40px}} header h1{{margin:0 0 8px}} header p{{margin:0;color:#d1d5db}}
+main{{max-width:1240px;margin:auto;padding:28px 20px 60px}} .section-card{{background:white;border-radius:14px;padding:26px;margin-bottom:28px;box-shadow:0 2px 14px rgba(15,23,42,.08)}}
+.metric-strip{{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:12px;margin:18px 0}} .metric-strip div{{background:#f3f4f6;border-radius:10px;padding:12px}} .metric-strip span{{display:block;font-size:12px;color:#6b7280;margin-bottom:4px}} .metric-strip strong{{font-size:18px;overflow-wrap:anywhere}}
+.figure-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px;margin-top:16px}} figure{{margin:0;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px}} figure img{{width:100%;display:block;border-radius:8px;background:white}} figcaption{{font-size:13px;color:#4b5563;margin-top:8px}}
+table{{width:100%;border-collapse:collapse;font-size:13px;overflow-x:auto;display:block}} th,td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:right;white-space:nowrap}} th:first-child,td:first-child{{text-align:left}} th{{background:#f3f4f6;color:#374151}} .selected-row td{{background:#ecfdf5}}
+.info-box{{background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:14px 16px;color:#1e3a8a}} .qc-sample-card{{border:1px solid #e5e7eb;border-radius:12px;padding:18px;margin-top:22px}} .missing-asset{{background:#fef2f2;border-color:#fecaca}} .missing-box{{height:220px;border-radius:8px;background:repeating-linear-gradient(45deg,#fee2e2,#fee2e2 10px,#fecaca 10px,#fecaca 20px);display:flex;align-items:center;justify-content:center;color:#991b1b;font-weight:bold}} code{{background:#f3f4f6;padding:2px 5px;border-radius:4px}}
+</style></head><body><header><h1>{html.escape(title)}</h1><p>Grey-scale-corrected model experiment, held-out validation, external baselines, and image-processing quality control.</p></header><main>
+<section class="section-card"><h2>Executive summary</h2><ol>
+<li>How do citizen-science orgC estimates compare with laboratory results?</li>
+<li>How does the direct grey-corrected SOC formula perform as a non-trained baseline?</li>
+<li>Which grey-scale image model is selected by repeated cross-validation, and how does it perform on the untouched final test set?</li>
+<li>Are grey-scale detection, correction, soil ROI, and colour outputs visually plausible?</li>
+</ol><div class="info-box">Model training and selection are performed only by <code>run_model_experiment.py</code>. This report does not retrain models and does not use final-test performance to select the winner.</div></section>
+{experiment_html}
+<section class="section-card"><h2>Metrics overview</h2>{overview}<h3>Error comparison</h3>{chart_html}</section>
+{cards}{worst_html}{mae_html}{qc_html}
+<section class="section-card"><h2>How to present the current status</h2><ul>
+<li>The primary statistical result is the selected grey-scale model's performance on the untouched final test set.</li>
+<li>Repeated cross-validation is used for model selection; final-test metrics are used only for final evaluation.</li>
+<li>The direct SOC formula and citizen-science estimate are baselines, not inputs to model selection.</li>
+<li>Interpolated Munsell features add predictive value only if their CV performance improves on continuous Lab features.</li>
+<li>Visual QC remains necessary because an incorrect grey-scale crop or soil ROI can invalidate numerical results.</li>
+</ul></section></main></body></html>'''
+    (out_dir / "index.html").write_text(document, encoding="utf-8")
 
 
 def run_report(args: argparse.Namespace) -> None:
     out_dir = Path(args.out)
     figures_dir = out_dir / "figures"
-
     out_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    lab_df = normalize_columns(read_table(args.lab))
-
-    no_gray_df = None
-    with_gray_df = None
-
-    if args.no_gray:
-        no_gray_df = normalize_columns(read_table(args.no_gray))
-
-    if args.with_gray:
-        with_gray_df = normalize_columns(read_table(args.with_gray))
+    lab = normalize_columns(read_table(args.lab))
+    with_gray = normalize_columns(read_table(args.with_gray))
+    experiment = load_model_experiment(args.experiment_dir)
+    selected_result, selected_row = build_selected_model_comparison(experiment["summary"], experiment["predictions"])
 
     results: list[ComparisonResult] = []
-    model_info = None
-
-    citizen_result = build_citizen_comparison(
-        lab_df=lab_df,
-        lab_col=args.lab_col,
-        citizen_col=args.citizen_col,
-    )
-
-    if citizen_result:
-        results.append(citizen_result)
+    citizen = build_citizen_comparison(lab, args.lab_col, args.citizen_col)
+    if citizen is not None:
+        results.append(citizen)
     else:
-        print(
-            "WARNING: Citizen comparison skipped. Could not find columns "
-            f"{args.lab_col!r} and {args.citizen_col!r} in {args.lab}.",
-            file=sys.stderr,
-        )
+        print(f"WARNING: citizen comparison skipped; missing {args.lab_col!r} or {args.citizen_col!r}.", file=sys.stderr)
 
-    if no_gray_df is not None:
-        no_gray_result, model_info = build_no_gray_trained_comparison(
-            no_gray_df=no_gray_df,
-            lab_col=args.lab_col,
-            feature_cols=args.no_gray_features,
-        )
+    direct = build_direct_gray_comparison(with_gray, args.lab_col, args.gray_estimate_col)
+    if direct is not None:
+        results.append(direct)
+    else:
+        print(f"WARNING: direct grey-scale baseline skipped; missing {args.lab_col!r} or {args.gray_estimate_col!r}.", file=sys.stderr)
 
-        if no_gray_result:
-            results.append(no_gray_result)
-
-    if with_gray_df is not None:
-        with_gray_result = build_with_gray_direct_comparison(
-            with_gray_df=with_gray_df,
-            lab_col=args.lab_col,
-            estimate_col=args.gray_estimate_col,
-        )
-
-        if with_gray_result:
-            results.append(with_gray_result)
-
-    if not results:
-        raise RuntimeError("No comparisons could be generated.")
-
+    results.append(selected_result)
     for result in results:
         result.figures = create_figures(result, figures_dir)
         write_predictions(result, out_dir)
 
-    summary_df = pd.DataFrame([metrics_to_summary_row(r) for r in results])
-    summary_df.to_csv(out_dir / "summary_metrics.csv", index=False)
+    summary = pd.DataFrame([metrics_summary_row(r) for r in results])
+    summary.to_csv(out_dir / "summary_metrics.csv", index=False)
+    experiment["summary"].to_csv(out_dir / "model_experiment_summary_with_gray.csv", index=False)
+    experiment["predictions"].to_csv(out_dir / "model_experiment_predictions_with_gray.csv", index=False)
+    experiment["split"].to_csv(out_dir / "model_experiment_split.csv", index=False)
 
-    qc_sample_codes = collect_qc_sample_codes(
-        explicit_codes=args.qc_sample_codes,
-        with_gray_df=with_gray_df,
-        no_gray_df=no_gray_df,
-        max_samples=args.qc_max_samples,
-    )
+    experiment_html = build_experiment_html(experiment["summary"], experiment["split"], selected_row)
+    worst_html = build_worst_errors_html(experiment["predictions"], str(selected_row["model"]), args.worst_error_count)
+    qc_codes = collect_qc_codes(args.qc_sample_codes, with_gray, args.qc_max_samples)
+    qc_html = build_qc_html(out_dir, qc_codes, Path(args.debug_masks_dir), Path(args.debug_gray_dir), Path(args.color_cards_with_gray_dir))
 
-    qc_examples_html = build_qc_examples_html(
-        out_dir=out_dir,
-        sample_codes=qc_sample_codes,
-        debug_masks_dir=Path(args.debug_masks_dir),
-        debug_gray_dir=Path(args.debug_gray_dir),
-        color_cards_with_gray_dir=Path(args.color_cards_with_gray_dir),
-        color_cards_no_gray_dir=Path(args.color_cards_no_gray_dir),
-    )
-
-    mae_rmse_html = build_mae_rmse_explanation_html(summary_df)
-
-    render_html_report(
-        results=results,
-        summary_df=summary_df,
-        out_dir=out_dir,
-        model_info=model_info,
-        title=args.title,
-        qc_examples_html=qc_examples_html,
-        mae_rmse_html=mae_rmse_html,
-    )
-
-    print("")
-    print(f"Report created: {out_dir / 'index.html'}")
+    render_report(out_dir, args.title, results, summary, experiment_html, worst_html, qc_html)
+    print(f"\nReport created: {out_dir / 'index.html'}")
     print(f"Summary metrics: {out_dir / 'summary_metrics.csv'}")
-    print("")
-    print("Open locally with:")
-    print(f"  python3 -m http.server 8088 --directory {out_dir}")
-    print("")
-    print("Then open:")
-    print("  http://localhost:8088")
+    print(f"Selected model: {selected_row['model']} (CV RMSE={fmt(selected_row.get('cv_RMSE_mean'))}, test RMSE={fmt(selected_row.get('test_RMSE'))})")
+    print(f"\nOpen locally with:\n  python3 -m http.server 8088 --directory {out_dir}\n\nThen open:\n  http://localhost:8088")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate automated presentation report for orgC comparisons."
-    )
-
-    parser.add_argument(
-        "--lab",
-        default="data/lab/test_stat_orgC.xlsx",
-        help="Laboratory file containing orgC_lab and optionally orgC_CS.",
-    )
-    parser.add_argument(
-        "--no-gray",
-        default="outputs/test_stat_orgC_enriched_no_gray.xlsx",
-        help="Enriched results file for images processed without grey-scale correction.",
-    )
-    parser.add_argument(
-        "--with-gray",
-        default="outputs/test_stat_orgC_enriched_with_gray.xlsx",
-        help="Enriched results file for images processed with grey-scale correction.",
-    )
-    parser.add_argument(
-        "--out",
-        default="outputs/presentation_report",
-        help="Output directory for the static HTML report.",
-    )
-    parser.add_argument(
-        "--lab-col",
-        default="orgC_lab",
-        help="Column name for laboratory organic carbon.",
-    )
-    parser.add_argument(
-        "--citizen-col",
-        default="orgC_CS",
-        help="Column name for citizen-science organic carbon estimate.",
-    )
-    parser.add_argument(
-        "--gray-estimate-col",
-        default="SOC_est%",
-        help="Column name for the direct grey-scale algorithm estimate.",
-    )
-    parser.add_argument(
-        "--no-gray-features",
-        nargs="+",
-        default=["L", "a", "b"],
-        help="Feature columns used to train the no-grey-scale calibration model.",
-    )
-    parser.add_argument(
-        "--title",
-        default="Soil orgC comparison report",
-        help="Title shown in the HTML report.",
-    )
-    parser.add_argument(
-        "--qc-sample-codes",
-        nargs="*",
-        default=None,
-        help=(
-            "Optional list of sample codes to show in the quality-control chapters, "
-            "for example: --qc-sample-codes APKC HGCM XGXK"
-        ),
-    )
-
-    parser.add_argument(
-        "--qc-max-samples",
-        type=int,
-        default=8,
-        help="Maximum number of automatically selected QC examples to show.",
-    )
-
-    parser.add_argument(
-        "--debug-masks-dir",
-        default="debug_masks",
-        help="Directory containing *_roi_rect.jpg files.",
-    )
-
-    parser.add_argument(
-        "--debug-gray-dir",
-        default="debug_gray",
-        help="Directory containing *_gray_roi.jpg and *_gray_before_after.jpg files.",
-    )
-
-    parser.add_argument(
-        "--color-cards-with-gray-dir",
-        default="outputs/color_cards_with_gray",
-        help="Directory containing with-gray *_comparison.jpg colour cards.",
-    )
-
-    parser.add_argument(
-        "--color-cards-no-gray-dir",
-        default="outputs/color_cards_no_gray",
-        help="Directory containing no-gray *_comparison.jpg colour cards.",
-    )
-
+    parser = argparse.ArgumentParser(description="Generate a grey-scale-only orgC model and QC report.")
+    parser.add_argument("--lab", default="data/lab/test_stat_orgC.xlsx", help="Laboratory file containing orgC_lab and optionally orgC_CS.")
+    parser.add_argument("--with-gray", default="outputs/test_stat_orgC_enriched_with_gray.xlsx", help="Enriched grey-scale-corrected image results.")
+    parser.add_argument("--experiment-dir", default="outputs/model_experiment", help="Directory containing run_model_experiment.py outputs.")
+    parser.add_argument("--out", default="outputs/presentation_report", help="Output directory for static HTML report.")
+    parser.add_argument("--lab-col", default="orgC_lab")
+    parser.add_argument("--citizen-col", default="orgC_CS")
+    parser.add_argument("--gray-estimate-col", default="SOC_est%")
+    parser.add_argument("--title", default="Grey-scale soil orgC model report")
+    parser.add_argument("--qc-sample-codes", nargs="*", default=None, help="Example: --qc-sample-codes APKC HGCM XGXK")
+    parser.add_argument("--qc-max-samples", type=int, default=8)
+    parser.add_argument("--debug-masks-dir", default="debug_masks")
+    parser.add_argument("--debug-gray-dir", default="debug_gray")
+    parser.add_argument("--color-cards-with-gray-dir", default="outputs/color_cards_with_gray")
+    parser.add_argument("--worst-error-count", type=int, default=10)
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
-    run_report(args)
+    run_report(parse_args())
 
 
 if __name__ == "__main__":
