@@ -55,7 +55,7 @@ def resolve_lab_paths(
     if not resolved:
         raise ValueError("No laboratory XLSX files were found.")
 
-    return sorted(resolved)
+    return resolved
 
 
 def read_lab_workbooks(
@@ -74,7 +74,7 @@ def read_lab_workbooks(
 
     frames: list[pd.DataFrame] = []
 
-    for path in paths:
+    for source_order, path in enumerate(paths):
         workbook = pd.ExcelFile(path)
 
         if preferred_sheet and preferred_sheet in workbook.sheet_names:
@@ -84,8 +84,15 @@ def read_lab_workbooks(
         else:
             sheet_name = workbook.sheet_names[0]
 
-        df = pd.read_excel(path, sheet_name=sheet_name)
-        df.columns = [str(column).strip() for column in df.columns]
+        df = pd.read_excel(
+            path,
+            sheet_name=sheet_name,
+        )
+
+        df.columns = [
+            str(column).strip()
+            for column in df.columns
+        ]
 
         missing = [
             column
@@ -95,28 +102,27 @@ def read_lab_workbooks(
 
         if missing:
             raise ValueError(
-                f"Laboratory file {path} is missing required columns: "
-                f"{missing}. Available columns: {list(df.columns)}"
+                f"Laboratory file {path} is missing required "
+                f"columns: {missing}. Available columns: "
+                f"{list(df.columns)}"
             )
 
-        # Remove completely empty rows.
         df = df.dropna(how="all").copy()
 
         df["_lab_source_file"] = path.name
         df["_lab_source_sheet"] = sheet_name
+        df["_lab_source_order"] = source_order
+        df["_lab_row_order"] = range(len(df))
 
         frames.append(df)
-
-        print(
-            f"Loaded {len(df)} laboratory rows from "
-            f"{path.name}, sheet {sheet_name!r}."
-        )
 
     combined = pd.concat(
         frames,
         ignore_index=True,
         sort=False,
     )
+
+    combined["_lab_input_order"] = range(len(combined))
 
     print(
         f"Combined {len(paths)} laboratory files into "

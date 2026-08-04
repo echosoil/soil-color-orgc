@@ -4,7 +4,9 @@ import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
+from numbers import Number
 
+from openpyxl import writer
 import pandas as pd
 
 from .lab_io import read_lab_workbooks
@@ -104,6 +106,385 @@ def _duplicate_error_message(
     )
 
 
+def _is_missing_value(value) -> bool:
+    if value is None:
+        return True
+
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "",
+            "nan",
+            "none",
+            "null",
+            "<na>",
+        }
+
+    try:
+        result = pd.isna(value)
+        return bool(result)
+    except (TypeError, ValueError):
+        return False
+
+
+def _comparison_key(value):
+    """
+    Normalize values for conflict detection.
+
+    Treat 1 and 1.0 as the same value.
+    """
+    if isinstance(value, bool):
+        return ("bool", value)
+
+    if isinstance(value, Number):
+        return ("number", round(float(value), 12))
+
+    if isinstance(value, pd.Timestamp):
+        return ("datetime", value.isoformat())
+
+    return ("text", str(value).strip())
+
+
+def _ordered_unique_text(values) -> list[str]:
+    result = []
+    seen = set()
+
+    for value in values:
+        if _is_missing_value(value):
+            continue
+
+        text = str(value).strip()
+
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+
+    return result
+
+
+def resolve_duplicate_lab_rows(
+    lab: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """
+    Collapse duplicate laboratory SampleCodes column by column.
+
+    Resolution rules:
+      - non-empty values fill empty values;
+      - identical values are kept once;
+      - conflicting non-empty values use the later --lab input file;
+      - conflicts are recorded for inspection.
+
+    Returns:
+      resolved_lab
+      duplicate_input_rows
+      resolution_report
+      conflict_report
+    """
+    lab = lab.copy()
+
+    if "SampleCode" not in lab.columns:
+        raise ValueError(
+            "Cannot resolve laboratory duplicates without SampleCode."
+        )
+
+    if "_lab_source_order" not in lab.columns:
+        lab["_lab_source_order"] = 0
+
+    if "_lab_row_order" not in lab.columns:
+        lab["_lab_row_order"] = range(len(lab))
+
+    if "_lab_input_order" not in lab.columns:
+        lab["_lab_input_order"] = range(len(lab))
+
+    duplicate_mask = (
+        lab["SampleCode"].notna()
+        & lab["SampleCode"].duplicated(keep=False)
+    )
+
+    duplicate_input_rows = (
+        lab.loc[duplicate_mask]
+        .sort_values(
+            [
+                "SampleCode",
+                "_lab_source_order",
+                "_lab_row_order",
+            ]
+        )
+        .copy()
+    )
+
+    output_rows = []
+    resolution_records = []
+    conflict_records = []
+
+    internal_columns = {
+        "_lab_source_file",
+        "_lab_source_sheet",
+        "_lab_source_order",
+        "_lab_row_order",
+        "_lab_input_order",
+        "_lab_source_files",
+        "_lab_source_sheets",
+        "_lab_duplicate_rows_merged",
+        "_lab_conflict_columns",
+    }
+
+    rows_with_code = lab[
+        lab["SampleCode"].notna()
+    ].copy()
+
+    for sample_code, group in rows_with_code.groupby(
+        "SampleCode",
+        sort=False,
+    ):
+        group = group.sort_values(
+            [
+                "_lab_source_order",
+                "_lab_row_order",
+            ]
+        )
+
+        # Start with the last row because later input files have priority.
+        merged = group.iloc[-1].copy()
+        conflict_columns = []
+
+        for column in lab.columns:
+            if column in internal_columns:
+                continue
+
+            candidates = []
+
+            for _, row in group.iterrows():
+                value = row[column]
+
+                if not _is_missing_value(value):
+                    candidates.append((row, value))
+
+            if not candidates:
+                merged[column] = pd.NA
+                continue
+
+            # Last non-empty value wins.
+            chosen_row, chosen_value = candidates[-1]
+            merged[column] = chosen_value
+
+            unique_values = {}
+
+            for source_row, value in candidates:
+                key = _comparison_key(value)
+
+                unique_values.setdefault(
+                    key,
+                    [],
+                ).append(
+                    {
+                        "value": value,
+                        "source_file": source_row.get(
+                            "_lab_source_file",
+                            "",
+                        ),
+                        "source_sheet": source_row.get(
+                            "_lab_source_sheet",
+                            "",
+                        ),
+                    }
+                )
+
+            if len(unique_values) > 1:
+                conflict_columns.append(column)
+
+                displayed_values = []
+
+                for source_row, value in candidates:
+                    source_file = source_row.get(
+                        "_lab_source_file",
+                        "",
+                    )
+                    source_sheet = source_row.get(
+                        "_lab_source_sheet",
+                        "",
+                    )
+
+                    displayed_values.append(
+                        f"{source_file}"
+                        f"[{source_sheet}]: {value!r}"
+                    )
+
+                conflict_records.append(
+                    {
+                        "SampleCode": sample_code,
+                        "column": column,
+                        "chosen_value": chosen_value,
+                        "chosen_source_file": chosen_row.get(
+                            "_lab_source_file",
+                            "",
+                        ),
+                        "chosen_source_sheet": chosen_row.get(
+                            "_lab_source_sheet",
+                            "",
+                        ),
+                        "all_values": " || ".join(
+                            displayed_values
+                        ),
+                    }
+                )
+
+        source_files = _ordered_unique_text(
+            group["_lab_source_file"]
+            if "_lab_source_file" in group.columns
+            else []
+        )
+
+        source_sheets = _ordered_unique_text(
+            group["_lab_source_sheet"]
+            if "_lab_source_sheet" in group.columns
+            else []
+        )
+
+        merged["_lab_source_files"] = " | ".join(
+            source_files
+        )
+
+        merged["_lab_source_sheets"] = " | ".join(
+            source_sheets
+        )
+
+        merged["_lab_duplicate_rows_merged"] = len(group)
+
+        merged["_lab_conflict_columns"] = " | ".join(
+            conflict_columns
+        )
+
+        # Retain the provenance of the highest-priority row.
+        merged["_lab_source_file"] = group.iloc[-1].get(
+            "_lab_source_file",
+            "",
+        )
+
+        merged["_lab_source_sheet"] = group.iloc[-1].get(
+            "_lab_source_sheet",
+            "",
+        )
+
+        merged["_lab_input_order"] = group[
+            "_lab_input_order"
+        ].min()
+
+        output_rows.append(merged.to_dict())
+
+        if len(group) > 1:
+            resolution_records.append(
+                {
+                    "SampleCode": sample_code,
+                    "input_rows": len(group),
+                    "rows_removed": len(group) - 1,
+                    "source_files": " | ".join(
+                        source_files
+                    ),
+                    "selected_source_file": merged[
+                        "_lab_source_file"
+                    ],
+                    "conflict_columns": " | ".join(
+                        conflict_columns
+                    ),
+                    "conflict_count": len(
+                        conflict_columns
+                    ),
+                }
+            )
+
+    # Rows whose SampleCode could not be extracted cannot be combined.
+    rows_without_code = lab[
+        lab["SampleCode"].isna()
+    ].copy()
+
+    for _, row in rows_without_code.iterrows():
+        row = row.copy()
+
+        source_file = row.get(
+            "_lab_source_file",
+            "",
+        )
+
+        source_sheet = row.get(
+            "_lab_source_sheet",
+            "",
+        )
+
+        row["_lab_source_files"] = source_file
+        row["_lab_source_sheets"] = source_sheet
+        row["_lab_duplicate_rows_merged"] = 1
+        row["_lab_conflict_columns"] = ""
+
+        output_rows.append(row.to_dict())
+
+    resolved = pd.DataFrame(output_rows)
+
+    if not resolved.empty:
+        resolved = resolved.sort_values(
+            "_lab_input_order",
+            na_position="last",
+        ).reset_index(drop=True)
+
+    resolved = resolved.drop(
+        columns=[
+            "_lab_source_order",
+            "_lab_row_order",
+            "_lab_input_order",
+        ],
+        errors="ignore",
+    )
+
+    resolution_report = pd.DataFrame(
+        resolution_records,
+        columns=[
+            "SampleCode",
+            "input_rows",
+            "rows_removed",
+            "source_files",
+            "selected_source_file",
+            "conflict_columns",
+            "conflict_count",
+        ],
+    )
+
+    conflict_report = pd.DataFrame(
+        conflict_records,
+        columns=[
+            "SampleCode",
+            "column",
+            "chosen_value",
+            "chosen_source_file",
+            "chosen_source_sheet",
+            "all_values",
+        ],
+    )
+
+    remaining_duplicates = (
+        resolved["SampleCode"].notna()
+        & resolved["SampleCode"].duplicated(
+            keep=False
+        )
+    )
+
+    if remaining_duplicates.any():
+        raise RuntimeError(
+            "Laboratory duplicate resolution failed: duplicate "
+            "SampleCodes remain after collapsing rows."
+        )
+
+    return (
+        resolved,
+        duplicate_input_rows,
+        resolution_report,
+        conflict_report,
+    )
+
+
 def enrich_lab_file(
     lab_xlsx: str | Path | Iterable[str | Path],
     predictions_csv: str | Path,
@@ -179,6 +560,13 @@ def enrich_lab_file(
         lab["SampleCode"]
     )
 
+    (
+        lab,
+        duplicate_lab_codes,
+        duplicate_lab_resolution,
+        duplicate_lab_conflicts,
+    ) = resolve_duplicate_lab_rows(lab)
+
     # ------------------------------------------------------------------
     # Build prediction matching keys
     # ------------------------------------------------------------------
@@ -234,26 +622,6 @@ def enrich_lab_file(
         )
         .copy()
     )
-
-    if fail_on_duplicate_lab_codes and not duplicate_lab_codes.empty:
-        raise ValueError(
-            _duplicate_error_message(
-                title=(
-                    "Duplicate laboratory SampleCodes were found across "
-                    "the combined XLSX files."
-                ),
-                duplicates=duplicate_lab_codes,
-                preferred_columns=[
-                    "SampleCode",
-                    "ID",
-                    "orgC_lab",
-                    "sd_lab",
-                    "orgC_CS",
-                    "_lab_source_file",
-                    "_lab_source_sheet",
-                ],
-            )
-        )
 
     if fail_on_duplicate_image_codes and not duplicate_image_codes.empty:
         raise ValueError(
@@ -394,6 +762,16 @@ def enrich_lab_file(
         else 1
     )
 
+    duplicate_lab_rows_collapsed = (
+        int(
+            duplicate_lab_resolution[
+                "rows_removed"
+            ].sum()
+        )
+        if not duplicate_lab_resolution.empty
+        else 0
+    )
+
     summary = pd.DataFrame(
         [
             {
@@ -423,6 +801,18 @@ def enrich_lab_file(
                 ),
                 "duplicate_image_code_rows": len(
                     duplicate_image_codes
+                ),
+                "duplicate_lab_input_rows": len(
+                    duplicate_lab_codes
+                ),
+                "duplicate_lab_codes_resolved": len(
+                    duplicate_lab_resolution
+                ),
+                "duplicate_lab_rows_collapsed": (
+                    duplicate_lab_rows_collapsed
+                ),
+                "duplicate_lab_conflict_cells": len(
+                    duplicate_lab_conflicts
                 ),
             }
         ]
@@ -612,6 +1002,24 @@ def enrich_lab_file(
             index=False,
         )
 
+        duplicate_lab_codes.to_excel(
+            writer,
+            sheet_name="duplicate_lab_input_rows",
+            index=False,
+        )
+
+        duplicate_lab_resolution.to_excel(
+            writer,
+            sheet_name="duplicate_lab_resolution",
+            index=False,
+        )
+
+        duplicate_lab_conflicts.to_excel(
+            writer,
+            sheet_name="duplicate_lab_conflicts",
+            index=False,
+        )
+
         # Useful when several laboratory files have been combined.
         if "_lab_source_file" in lab.columns:
             laboratory_sources = (
@@ -659,6 +1067,21 @@ def enrich_lab_file(
         index=False,
     )
 
+    duplicate_lab_codes.to_csv(
+        f"{base}_duplicate_lab_input_rows.csv",
+        index=False,
+    )
+
+    duplicate_lab_resolution.to_csv(
+        f"{base}_duplicate_lab_resolution.csv",
+        index=False,
+    )
+
+    duplicate_lab_conflicts.to_csv(
+        f"{base}_duplicate_lab_conflicts.csv",
+        index=False,
+    )
+    
     summary.to_csv(
         f"{base}_summary.csv",
         index=False,

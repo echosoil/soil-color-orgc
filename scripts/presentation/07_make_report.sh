@@ -55,7 +55,7 @@ python3 scripts/presentation/01_orgc_lab_vs_cs.py
 echo
 echo "=== 4. Compare direct SOC formula with laboratory results ==="
 
-python3 scripts/presentation/06_combined_lab_vs_SOC_est.py
+python3 scripts/presentation/06_compare_lab_vs_soc_est.py
 
 echo
 echo "=== 5. Run trained model experiment ==="
