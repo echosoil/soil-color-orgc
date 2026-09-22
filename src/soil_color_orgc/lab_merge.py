@@ -12,6 +12,50 @@ import pandas as pd
 from .lab_io import read_lab_workbooks
 
 
+def sample_code_from_prediction_row(
+    row: pd.Series,
+) -> str | None:
+    """
+    Extract the base sample code used to join an image prediction
+    with the laboratory table.
+
+    Image filename has priority.
+    """
+
+    image = row.get("image")
+
+    if image is not None and not pd.isna(image):
+        filename = os.path.basename(str(image).strip())
+        stem = os.path.splitext(filename)[0]
+
+        match = re.match(
+            r"\s*([A-Za-z0-9]+)",
+            stem,
+        )
+
+        if match:
+            return match.group(1).upper()
+
+    for column in (
+        "filename_code_base",
+        "sample_code_base",
+        "sample_code_full",
+    ):
+        value = row.get(column)
+
+        if value is None or pd.isna(value):
+            continue
+
+        match = re.match(
+            r"\s*([A-Za-z0-9]+)",
+            str(value).strip(),
+        )
+
+        if match:
+            return match.group(1).upper()
+
+    return None
+
 def base_code_from_lab(id_str) -> str | None:
     """
     Extract the leading alphanumeric sample code from a laboratory ID.
@@ -570,24 +614,10 @@ def enrich_lab_file(
     # ------------------------------------------------------------------
     # Build prediction matching keys
     # ------------------------------------------------------------------
-    if "sample_code_base" in predictions.columns:
-        predictions["SampleCode"] = normalize_sample_codes(
-            predictions["sample_code_base"]
-        )
-
-        missing_prediction_code = predictions["SampleCode"].isna()
-
-        predictions.loc[
-            missing_prediction_code,
-            "SampleCode",
-        ] = predictions.loc[
-            missing_prediction_code,
-            "image",
-        ].apply(base_code_from_image)
-    else:
-        predictions["SampleCode"] = predictions[
-            "image"
-        ].apply(base_code_from_image)
+    predictions["SampleCode"] = predictions.apply(
+        sample_code_from_prediction_row,
+        axis=1,
+    )
 
     predictions["SampleCode"] = normalize_sample_codes(
         predictions["SampleCode"]
@@ -691,6 +721,31 @@ def enrich_lab_file(
     # SampleCode must always be retained for the merge.
     if "SampleCode" not in prediction_columns:
         prediction_columns.insert(0, "SampleCode")
+
+
+    lab_codes = set(
+        lab["SampleCode"].dropna().astype(str)
+    )
+
+    prediction_codes = set(
+        predictions["SampleCode"].dropna().astype(str)
+    )
+
+    common_codes = lab_codes & prediction_codes
+
+    print("\n=== Lab/image matching keys ===")
+    print(f"Unique lab codes:        {len(lab_codes)}")
+    print(f"Unique prediction codes: {len(prediction_codes)}")
+    print(f"Common codes:            {len(common_codes)}")
+
+    print("\nExample lab codes:")
+    print(sorted(lab_codes)[:20])
+
+    print("\nExample prediction codes:")
+    print(sorted(prediction_codes)[:20])
+
+    print("\nExample common codes:")
+    print(sorted(common_codes)[:20])
 
     # ------------------------------------------------------------------
     # Main merge

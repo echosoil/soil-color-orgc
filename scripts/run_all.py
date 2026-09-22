@@ -106,37 +106,61 @@ def normalize_sample_code(value) -> str | None:
     return text.upper()
 
 
-def prediction_sample_code(
-    row: pd.Series,
-) -> str | None:
+def prediction_sample_code(row: pd.Series) -> str | None:
     """
-    Determine the sample code from prediction metadata or the image filename.
+    Determine the laboratory matching code.
+
+    IMPORTANT:
+    The image filename is authoritative for the lab/image join.
+
+    Examples:
+        ABYU.jfif       -> ABYU
+        ABYU.jpg        -> ABYU
+        ABYU-foo.jpg    -> ABYU
+
+    Pipeline/OCR sample-code fields are only fallbacks.
     """
-    for column in (
-        "SampleCode",
-        "sample_code_base",
-        "filename_code_base",
-    ):
-        value = normalize_sample_code(row.get(column))
 
-        if value:
-            return value
-
+    # 1. Filename first
     image = row.get("image")
 
-    if image is None or pd.isna(image):
-        return None
+    if image is not None and not pd.isna(image):
+        filename = os.path.basename(str(image).strip())
+        stem = os.path.splitext(filename)[0]
 
-    filename = os.path.basename(str(image).strip())
-    stem = os.path.splitext(filename)[0]
+        match = re.match(
+            r"\s*([A-Za-z0-9]+)",
+            stem,
+        )
 
-    match = re.match(
-        r"\s*([A-Za-z0-9]+)",
-        stem,
-    )
+        if match:
+            return match.group(1).upper()
 
-    return match.group(1).upper() if match else None
+    # 2. Fallback to pipeline-derived codes
+    for column in (
+        "filename_code_base",
+        "sample_code_base",
+        "sample_code_full",
+    ):
+        value = row.get(column)
 
+        if value is None or pd.isna(value):
+            continue
+
+        text = str(value).strip()
+
+        if not text:
+            continue
+
+        match = re.match(
+            r"\s*([A-Za-z0-9]+)",
+            text,
+        )
+
+        if match:
+            return match.group(1).upper()
+
+    return None
 
 def coerce_nullable_boolean(
     series: pd.Series,
@@ -296,6 +320,16 @@ def combine_prediction_tables(
         axis=1,
     )
 
+    combined["filename_match_code"] = combined["image"].apply(
+        lambda value: (
+            prediction_sample_code(
+                pd.Series({"image": value})
+            )
+            if pd.notna(value)
+            else None
+        )
+    )
+    
     combined["source_priority"] = (
         combined["image_source"]
         .map(

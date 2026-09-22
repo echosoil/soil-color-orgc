@@ -8,6 +8,7 @@ INCLUDE_WITHOUT_GRAY="${INCLUDE_WITHOUT_GRAY:-1}"
 LAB_FILES=(
   data/lab/test_stat_orgC.xlsx
   data/lab/test_stat_orgC_v1_enriched.xlsx
+  data/lab/source/test_stat_orgC_update_2026_09.xlsx
 )
 
 RESULTS_FILE="outputs/results_combined.csv"
