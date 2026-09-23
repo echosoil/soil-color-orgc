@@ -8,7 +8,7 @@ INCLUDE_WITHOUT_GRAY="${INCLUDE_WITHOUT_GRAY:-1}"
 LAB_FILES=(
   data/lab/test_stat_orgC.xlsx
   data/lab/test_stat_orgC_v1_enriched.xlsx
-  data/lab/source/test_stat_orgC_update_2026_09.xlsx
+  data/lab/test_stat_orgC_update_2026_09.xlsx
 )
 
 RESULTS_FILE="outputs/results_combined.csv"
@@ -75,12 +75,15 @@ echo
 echo "=== 6. Generate presentation report ==="
 
 python3 scripts/make_presentation_report.py \
-  --lab "${LAB_FILES[@]}" \
-  --with-gray "$ENRICHED_FILE" \
-  --experiment-dir "$EXPERIMENT_DIR" \
-  --color-cards-with-gray-dir outputs/color_cards_combined \
-  --out "$REPORT_DIR" \
-  --qc-max-samples 4
+    --lab outputs/test_stat_orgC_enriched_combined.xlsx \
+    --with-gray outputs/test_stat_orgC_enriched_combined.xlsx \
+    --experiment-dir outputs/model_experiment \
+    --out outputs/presentation_report \
+    --qc-sample-codes APKC ABVA \
+    --qc-max-samples 2 \
+    --debug-masks-dir debug_masks \
+    --debug-gray-dir debug_gray \
+    --color-cards-with-gray-dir outputs/color_cards_combined
 
 echo
 echo "Report created:"
