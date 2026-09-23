@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a grey-scale-only soil orgC model and QC report.
+"""Generate a soil orgC model and QC report from the current combined pipeline.
 
 The report uses only:
 1. Laboratory orgC vs citizen-science estimates as an external baseline.
@@ -7,8 +7,9 @@ The report uses only:
 3. The grey-scale-only model experiment produced by run_model_experiment.py.
 4. Grey-scale detection, correction, soil-ROI, and colour-card QC images.
 
-The report never trains models and never uses another image dataset. Model
-selection is based on repeated cross-validation in the experiment output; the
+The report never trains models. Grey-reference analyses filter the combined
+image dataset using image_source='with_gray'. Model selection is based on repeated
+cross-validation in the experiment output; the
 held-out test set is used only for final evaluation.
 """
 
@@ -89,12 +90,24 @@ def clean_pair_df(df: pd.DataFrame, true_col: str, pred_col: str) -> pd.DataFram
     missing = [c for c in [true_col, pred_col] if c not in df.columns]
     if missing:
         raise ValueError(f"Missing comparison columns: {missing}")
+
     df = df.copy()
     df[true_col] = pd.to_numeric(df[true_col], errors="coerce")
     df[pred_col] = pd.to_numeric(df[pred_col], errors="coerce")
-    keep = [c for c in ["ID", "SampleCode", "sample_code_base", "image", "model"] if c in df.columns]
+
+    keep = [
+        c
+        for c in [
+            "ID", "SampleCode", "sample_code_base", "image", "model",
+            "image_source", "gray_scale_requested", "gray_scale_applied",
+            "calibration_mode", "processing_status",
+        ]
+        if c in df.columns
+    ]
     keep += [true_col, pred_col]
-    return df[list(dict.fromkeys(keep))].dropna(subset=[true_col, pred_col]).copy()
+    return df[list(dict.fromkeys(keep))].dropna(
+        subset=[true_col, pred_col]
+    ).copy()
 
 
 def compute_ccc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -253,19 +266,46 @@ def build_citizen_comparison(lab: pd.DataFrame, lab_col: str, citizen_col: str) 
     )
 
 
-def build_direct_gray_comparison(df: pd.DataFrame, lab_col: str, estimate_col: str) -> ComparisonResult | None:
+def build_direct_gray_comparison(
+    df: pd.DataFrame,
+    lab_col: str,
+    estimate_col: str,
+) -> ComparisonResult | None:
     df = filter_processing_ok(df)
+
+    # The current pipeline may pass the combined enriched workbook here.
+    # Restrict this baseline to photographs acquired in the grey-reference mode.
+    if "image_source" in df.columns:
+        source = (
+            df["image_source"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        df = df.loc[source.eq("with_gray")].copy()
+
     if lab_col not in df.columns or estimate_col not in df.columns:
         return None
+
     df = clean_pair_df(df, lab_col, estimate_col)
     if df.empty:
         return None
+
     metrics = compute_metrics(df[lab_col], df[estimate_col])
     return ComparisonResult(
-        "direct_gray_heuristic", "Laboratory vs direct grey-corrected SOC heuristic",
-        "Direct formula-based SOC estimate", df, lab_col, estimate_col,
-        "Formula-based estimate after grey-scale correction; no supervised training is involved.",
-        metrics, interpret_metrics(metrics, "direct_gray")
+        "direct_gray_heuristic",
+        "Laboratory vs direct grey-reference SOC heuristic",
+        "Direct formula-based SOC estimate",
+        df,
+        lab_col,
+        estimate_col,
+        (
+            "Formula-based estimate for photographs acquired in the grey-reference "
+            "mode; no supervised training is involved."
+        ),
+        metrics,
+        interpret_metrics(metrics, "direct_gray"),
     )
 
 
@@ -344,59 +384,182 @@ def write_predictions(result: ComparisonResult, out_dir: Path) -> None:
 
 
 def extract_sample_code(value) -> str | None:
-    if value is None or pd.isna(value): return None
-    match = re.search(r"[A-Za-z]{4}", Path(str(value).strip()).stem)
-    return match.group(0).upper() if match else None
+    if value is None or pd.isna(value):
+        return None
 
-
-def collect_qc_codes(explicit: list[str] | None, df: pd.DataFrame, maximum: int) -> list[str]:
-    codes: list[str] = []
-    values = explicit or []
-    if not explicit:
-        for col in ["sample_code_base", "SampleCode", "ID", "image"]:
-            if col in df.columns:
-                values = df[col].dropna().tolist(); break
-    for value in values:
-        code = extract_sample_code(value)
-        if code and code not in codes: codes.append(code)
-        if len(codes) >= maximum: break
-    return codes
+    stem = Path(str(value).strip()).stem
+    match = re.match(r"\s*([A-Za-z0-9]+)", stem)
+    return match.group(1).upper() if match else None
 
 
 def find_ci(directory: Path, filename: str) -> Path | None:
     direct = directory / filename
-    if direct.exists(): return direct
-    if not directory.exists(): return None
+    if direct.exists():
+        return direct
+    if not directory.exists():
+        return None
+
     target = filename.lower()
-    return next((p for p in directory.iterdir() if p.is_file() and p.name.lower() == target), None)
+    return next(
+        (
+            p
+            for p in directory.iterdir()
+            if p.is_file() and p.name.lower() == target
+        ),
+        None,
+    )
 
 
-def copy_asset(source: Path | None, out_dir: Path, subdir: str, name: str) -> str | None:
-    if source is None or not source.exists(): return None
-    target_dir = out_dir / subdir; target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / name; shutil.copy2(source, target)
+def qc_asset_paths(
+    code: str,
+    masks: Path,
+    gray: Path,
+    cards: Path,
+) -> dict[str, Path | None]:
+    return {
+        "soil": find_ci(masks, f"{code}_roi_rect.jpg"),
+        "grayrect": find_ci(gray, f"{code}_gray_roi_rect.jpg"),
+        "grayroi": find_ci(gray, f"{code}_gray_roi.jpg"),
+        "beforeafter": find_ci(gray, f"{code}_gray_before_after.jpg"),
+        "card": find_ci(cards, f"{code}_comparison.jpg"),
+    }
+
+
+def collect_qc_codes(
+    explicit: list[str] | None,
+    df: pd.DataFrame,
+    maximum: int,
+    masks: Path,
+    gray: Path,
+    cards: Path,
+) -> list[str]:
+    """Choose useful grey-reference QC examples.
+
+    Automatic selection excludes image_source='without_gray' and prefers
+    samples for which all expected diagnostic artefacts are available.
+    """
+    maximum = max(0, int(maximum))
+    if maximum == 0:
+        return []
+
+    candidates: list[str] = []
+
+    if explicit:
+        for value in explicit:
+            code = extract_sample_code(value)
+            if code and code not in candidates:
+                candidates.append(code)
+        return candidates[:maximum]
+
+    work = df.copy()
+    if "image_source" in work.columns:
+        source = (
+            work["image_source"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        work = work.loc[source.eq("with_gray")].copy()
+
+    for col in ["SampleCode", "sample_code_base", "image", "ID"]:
+        if col not in work.columns:
+            continue
+        for value in work[col].dropna():
+            code = extract_sample_code(value)
+            if code and code not in candidates:
+                candidates.append(code)
+        if candidates:
+            break
+
+    complete: list[str] = []
+    partial: list[tuple[int, str]] = []
+
+    for code in candidates:
+        assets = qc_asset_paths(code, masks, gray, cards)
+        present = sum(path is not None for path in assets.values())
+        if present == len(assets):
+            complete.append(code)
+        elif present > 0:
+            partial.append((present, code))
+
+    selected = complete[:maximum]
+    if len(selected) < maximum:
+        partial.sort(key=lambda item: (-item[0], item[1]))
+        selected.extend(code for _, code in partial[: maximum - len(selected)])
+
+    return selected
+
+
+def copy_asset(
+    source: Path | None,
+    out_dir: Path,
+    subdir: str,
+    name: str,
+) -> str | None:
+    if source is None or not source.exists():
+        return None
+
+    target_dir = out_dir / subdir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / name
+    shutil.copy2(source, target)
     return target.relative_to(out_dir).as_posix()
 
 
-def image_html(title: str, relative: str | None, caption: str, missing: str) -> str:
+def image_html(
+    title: str,
+    relative: str | None,
+    caption: str,
+    missing: str,
+) -> str:
     if relative:
-        return f'<figure><img src="{html.escape(relative)}" alt="{html.escape(title)}"><figcaption><strong>{html.escape(title)}.</strong> {html.escape(caption)}</figcaption></figure>'
-    return f'<figure class="missing-asset"><div class="missing-box">Missing image</div><figcaption><strong>{html.escape(title)}.</strong> {html.escape(missing)}</figcaption></figure>'
+        return (
+            f'<figure><img src="{html.escape(relative)}" alt="{html.escape(title)}">'
+            f'<figcaption><strong>{html.escape(title)}.</strong> '
+            f'{html.escape(caption)}</figcaption></figure>'
+        )
+
+    return (
+        '<figure class="missing-asset">'
+        '<div class="missing-box">Missing diagnostic</div>'
+        f'<figcaption><strong>{html.escape(title)}.</strong> '
+        f'{html.escape(missing)}</figcaption></figure>'
+    )
 
 
-def build_qc_html(out_dir: Path, codes: list[str], masks: Path, gray: Path, cards: Path) -> str:
+def build_qc_html(
+    out_dir: Path,
+    codes: list[str],
+    masks: Path,
+    gray: Path,
+    cards: Path,
+) -> str:
     if not codes:
-        return '<section class="section-card"><h2>Image-processing QC</h2><p>No QC codes selected.</p></section>'
+        return (
+            '<section class="section-card"><h2>Image-processing quality control</h2>'
+            '<p>No suitable grey-reference QC examples were found automatically.</p>'
+            '</section>'
+        )
+
     sections = []
+
     for code in codes:
+        source_assets = qc_asset_paths(code, masks, gray, cards)
         assets = {
-            "soil": copy_asset(find_ci(masks, f"{code}_roi_rect.jpg"), out_dir, "assets/qc/masks", f"{code}_roi_rect.jpg"),
-            "grayrect": copy_asset(find_ci(gray, f"{code}_gray_roi_rect.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_roi_rect.jpg"),
-            "grayroi": copy_asset(find_ci(gray, f"{code}_gray_roi.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_roi.jpg"),
-            "beforeafter": copy_asset(find_ci(gray, f"{code}_gray_before_after.jpg"), out_dir, "assets/qc/gray", f"{code}_gray_before_after.jpg"),
-            "card": copy_asset(find_ci(cards, f"{code}_comparison.jpg"), out_dir, "assets/qc/cards", f"{code}_comparison.jpg"),
+            "soil": copy_asset(source_assets["soil"], out_dir, "assets/qc/masks", f"{code}_roi_rect.jpg"),
+            "grayrect": copy_asset(source_assets["grayrect"], out_dir, "assets/qc/gray", f"{code}_gray_roi_rect.jpg"),
+            "grayroi": copy_asset(source_assets["grayroi"], out_dir, "assets/qc/gray", f"{code}_gray_roi.jpg"),
+            "beforeafter": copy_asset(source_assets["beforeafter"], out_dir, "assets/qc/gray", f"{code}_gray_before_after.jpg"),
+            "card": copy_asset(source_assets["card"], out_dir, "assets/qc/cards", f"{code}_comparison.jpg"),
         }
-        sections.append(f'''<section class="qc-sample-card"><h3>Sample {html.escape(code)}</h3>
+
+        present = sum(value is not None for value in assets.values())
+        status = f"{present}/5 expected QC artefacts available"
+
+        sections.append(f'''<section class="qc-sample-card">
+        <h3>Sample {html.escape(code)}</h3>
+        <p><strong>QC assets:</strong> {html.escape(status)}</p>
         <div class="figure-grid">
         {image_html("Soil ROI", assets["soil"], "The rectangle should contain representative soil only.", str(masks / f"{code}_roi_rect.jpg"))}
         {image_html("Detected grey-scale rectangle", assets["grayrect"], "The rectangle should surround the full 11-patch scale.", str(gray / f"{code}_gray_roi_rect.jpg"))}
@@ -404,7 +567,15 @@ def build_qc_html(out_dir: Path, codes: list[str], masks: Path, gray: Path, card
         {image_html("Before/after correction", assets["beforeafter"], "Correction should neutralise colour cast without clipping or distortion.", str(gray / f"{code}_gray_before_after.jpg"))}
         {image_html("Colour/Munsell card", assets["card"], "Visual check of ROI colour, Lab estimate, closest Munsell chip, and direct SOC heuristic.", str(cards / f"{code}_comparison.jpg"))}
         </div></section>''')
-    return '<section class="section-card"><h2>Image-processing quality control</h2><p>These examples verify that grey-scale detection and soil colour extraction are visually plausible.</p>' + ''.join(sections) + '</section>'
+
+    return (
+        '<section class="section-card">'
+        '<h2>Image-processing quality control</h2>'
+        '<p>Automatically selected examples are restricted to grey-reference photographs and prioritise samples with complete diagnostic artefacts.</p>'
+        + ''.join(sections)
+        + '</section>'
+    )
+
 
 def metrics_summary_row(result: ComparisonResult) -> dict:
     row = {"scenario": result.title, **result.metrics, "method_note": result.method_note}
@@ -619,8 +790,21 @@ def run_report(args: argparse.Namespace) -> None:
 
     experiment_html = build_experiment_html(experiment["summary"], experiment["split"], selected_row)
     worst_html = build_worst_errors_html(experiment["predictions"], str(selected_row["model"]), args.worst_error_count)
-    qc_codes = collect_qc_codes(args.qc_sample_codes, with_gray, args.qc_max_samples)
-    qc_html = build_qc_html(out_dir, qc_codes, Path(args.debug_masks_dir), Path(args.debug_gray_dir), Path(args.color_cards_with_gray_dir))
+    masks_dir = Path(args.debug_masks_dir)
+    gray_dir = Path(args.debug_gray_dir)
+    cards_dir = Path(args.color_cards_with_gray_dir)
+    qc_codes = collect_qc_codes(
+        args.qc_sample_codes,
+        with_gray,
+        args.qc_max_samples,
+        masks_dir,
+        gray_dir,
+        cards_dir,
+    )
+    print(f"QC samples selected: {qc_codes}")
+    qc_html = build_qc_html(
+        out_dir, qc_codes, masks_dir, gray_dir, cards_dir
+    )
 
     render_report(out_dir, args.title, results, summary, experiment_html, worst_html, qc_html)
     print(f"\nReport created: {out_dir / 'index.html'}")
@@ -630,9 +814,9 @@ def run_report(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a grey-scale-only orgC model and QC report.")
+    parser = argparse.ArgumentParser(description="Generate a soil orgC model and QC report from the combined enriched dataset.")
     parser.add_argument("--lab", default="data/lab/test_stat_orgC.xlsx", help="Laboratory file containing orgC_lab and optionally orgC_CS.")
-    parser.add_argument("--with-gray", default="outputs/test_stat_orgC_enriched_with_gray.xlsx", help="Enriched grey-scale-corrected image results.")
+    parser.add_argument("--with-gray", default="outputs/test_stat_orgC_enriched_combined.xlsx", help="Enriched image results. Combined workbooks are supported; grey-reference rows are selected using image_source=with_gray.")
     parser.add_argument("--experiment-dir", default="outputs/model_experiment", help="Directory containing run_model_experiment.py outputs.")
     parser.add_argument("--out", default="outputs/presentation_report", help="Output directory for static HTML report.")
     parser.add_argument("--lab-col", default="orgC_lab")
@@ -643,7 +827,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qc-max-samples", type=int, default=8)
     parser.add_argument("--debug-masks-dir", default="debug_masks")
     parser.add_argument("--debug-gray-dir", default="debug_gray")
-    parser.add_argument("--color-cards-with-gray-dir", default="outputs/color_cards_with_gray")
+    parser.add_argument("--color-cards-with-gray-dir", default="outputs/color_cards_combined", help="Directory containing current colour/Munsell comparison cards.")
     parser.add_argument("--worst-error-count", type=int, default=10)
     return parser.parse_args()
 

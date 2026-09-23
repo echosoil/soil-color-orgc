@@ -75,15 +75,11 @@ echo
 echo "=== 6. Generate presentation report ==="
 
 python3 scripts/make_presentation_report.py \
-    --lab outputs/test_stat_orgC_enriched_combined.xlsx \
-    --with-gray outputs/test_stat_orgC_enriched_combined.xlsx \
-    --experiment-dir outputs/model_experiment \
-    --out outputs/presentation_report \
-    --qc-sample-codes APKC ABVA \
-    --qc-max-samples 2 \
-    --debug-masks-dir debug_masks \
-    --debug-gray-dir debug_gray \
-    --color-cards-with-gray-dir outputs/color_cards_combined
+  --lab outputs/test_stat_orgC_enriched_combined.xlsx \
+  --with-gray outputs/test_stat_orgC_enriched_combined.xlsx \
+  --experiment-dir outputs/model_experiment \
+  --out outputs/presentation_report \
+  --qc-max-samples 8
 
 echo
 echo "Report created:"
