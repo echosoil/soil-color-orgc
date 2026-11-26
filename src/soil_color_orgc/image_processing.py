@@ -281,6 +281,102 @@ def trim_soil_roi_to_nonwhite_content(
     return trimmed_roi, trimmed_rect
 
 
+def extract_color_features(
+    image_bgr,
+    *,
+    roi=None,
+    use_gray_calibration=False,
+    downscale_max=800,
+    trim_percent=0.05,
+    strict=True,
+    debug_dir=None,
+    gray_debug_dir=None,
+    image_name="image",
+):
+    """Return Lab and diagnostics. ROI is normalized in portrait-oriented space.
+
+    Strict mode never falls back to unmasked pixels. The legacy batch wrapper
+    explicitly opts out to preserve its historical calculation.
+    """
+    if not isinstance(image_bgr, np.ndarray) or image_bgr.dtype != np.uint8:
+        raise ValueError("Expected a uint8 BGR image")
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3 or min(image_bgr.shape[:2]) < 32:
+        raise ValueError("Expected a BGR image at least 32 by 32 pixels")
+    if not 32 <= downscale_max <= 2000 or not 0 <= trim_percent < 0.5:
+        raise ValueError("Invalid analysis configuration")
+    if roi is None:
+        roi = (0.40, 0.50, 0.60, 0.70)
+    if len(roi) != 4 or not all(np.isfinite(v) for v in roi):
+        raise ValueError("ROI must contain four finite coordinates")
+    x0, y0, x1, y1 = roi
+    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+        raise ValueError("ROI must be ordered and inside the image")
+    image_bgr = downscale_max_side(ensure_portrait_orientation(image_bgr), downscale_max)
+    height, width = image_bgr.shape[:2]
+    warnings = []
+    calibration = "not_requested"
+    calibration_metrics = None
+    if use_gray_calibration:
+        try:
+            corrected, report = correct_image_using_gray_scale(
+                image_bgr, n_patches=11, debug_dir=gray_debug_dir, image_name=image_name
+            )
+            if len(report) != 11 or not np.isfinite(
+                report[["imbalance_before", "imbalance_after"]].to_numpy()
+            ).all():
+                raise ValueError("Invalid gray reference diagnostics")
+            calibration_metrics = {
+                "mean_imbalance_before": float(report["imbalance_before"].mean()),
+                "mean_imbalance_after": float(report["imbalance_after"].mean()),
+            }
+            image_bgr = corrected
+            calibration = "applied"
+            if calibration_metrics["mean_imbalance_after"] >= calibration_metrics["mean_imbalance_before"]:
+                warnings.append("gray_imbalance_not_improved")
+        except Exception as exc:
+            calibration = "failed_uncorrected"
+            warnings.append("gray_calibration_failed")
+            if not strict:
+                print(f"  WARNING: grey-scale calibration failed for {image_name}: {exc}. Using uncorrected image.", flush=True)
+
+    roi_bgr, rect = crop_central_soil_roi(
+        image_bgr, x_min=x0, x_max=x1, y_min=y0, y_max=y1
+    )
+    roi_bgr, rect = trim_soil_roi_to_nonwhite_content(roi_bgr, rect)
+    if roi_bgr.size == 0:
+        raise ValueError("Empty soil ROI")
+    mask = build_simple_roi_mask(roi_bgr)
+    if debug_dir:
+        save_debug_images(image_bgr, roi_bgr, mask, rect, image_name, debug_dir)
+    blurred = cv2.GaussianBlur(roi_bgr, (9, 9), 0)
+    selected = blurred[mask > 0]
+    count = int(selected.shape[0])
+    total = int(mask.size)
+    diagnostics = {
+        "image_width": width, "image_height": height,
+        "roi_pixels": list(rect), "selected_pixels": count,
+        "roi_pixel_count": total, "selected_fraction": count / total,
+        "gray_calibration": calibration, "gray_metrics": calibration_metrics,
+        "warnings": warnings, "used_full_roi_fallback": False,
+    }
+    if count < 500 or (strict and count / total < 0.10):
+        warnings.append("insufficient_soil_pixels")
+        if strict:
+            return {"status": "insufficient_soil_pixels", "lab": None, **diagnostics}
+        selected = blurred.reshape(-1, 3)
+        diagnostics["used_full_roi_fallback"] = True
+    pixels = trim_lab_by_lightness(bgr_pixels_to_lab(selected), trim_percent)
+    median = np.median(pixels, axis=0)
+    if not np.isfinite(median).all():
+        raise ValueError("Nonfinite colour result")
+    if median[0] > 75:
+        warnings.append("high_lightness_check_roi")
+        if not strict:
+            print(f"  WARNING: very bright estimated soil color for {image_name}: L={median[0]:.2f}. Check ROI/mask.", flush=True)
+    return {"status": "review" if warnings else "ok",
+            "lab": tuple(float(x) for x in median), **diagnostics}
+
+
 def extract_dominant_lab(
     image_path: str,
     save_debug_masks: bool = True,
@@ -290,101 +386,15 @@ def extract_dominant_lab(
     trim_percent: float = 0.08,
     use_gray_calibration: bool = True,
 ):
-    """
-    Extract representative soil color from a fixed central ROI.
-
-    This version deliberately does NOT use KMeans.
-
-    Current strategy:
-        1. Read image with OpenCV.
-        2. Downscale if large.
-        3. Crop central ROI: x 40-60%, y 50-70%.
-        4. Build loose mask inside ROI.
-        5. Blur ROI to reduce grain-level noise.
-        6. Convert selected pixels to Lab.
-        7. Trim darkest/brightest pixels.
-        8. Return median Lab.
-
-    kmeans_clusters is kept in the function signature only so pipeline.py
-    does not need to change.
-    """
-    image_name = os.path.basename(image_path)
-
-    image_bgr = read_image_bgr(image_path, use_icc=True)
-
-    if image_bgr is None:
-        raise ValueError(f"Could not read image: {image_path}")
-
-    image_bgr = ensure_portrait_orientation(image_bgr)
-    image_bgr = downscale_max_side(image_bgr, max_side=downscale_max)
-   
-    if use_gray_calibration:
-        try:
-            image_bgr, gray_report = correct_image_using_gray_scale(
-                image_bgr,
-                n_patches=11,
-                debug_dir="debug_gray" if save_debug_masks else None,
-                image_name=image_name,
-            )
-        except Exception as exc:
-            print(
-                f"  WARNING: grey-scale calibration failed for {image_name}: {exc}. "
-                f"Using uncorrected image.",
-                flush=True,
-            )
-
-    roi_bgr, rect = crop_central_soil_roi(
-        image_bgr,
-        x_min=0.40,
-        x_max=0.60,
-        y_min=0.50,
-        y_max=0.70,
-    )
-
-    roi_bgr, rect = trim_soil_roi_to_nonwhite_content(
-        roi_bgr,
-        rect,
-    )
-
-    if roi_bgr.size == 0:
-        raise ValueError(f"Empty ROI for image: {image_path}")
-
-    mask_u8 = build_simple_roi_mask(roi_bgr)
-
-    if save_debug_masks:
-        save_debug_images(
-            image_bgr=image_bgr,
-            roi_bgr=roi_bgr,
-            mask_u8=mask_u8,
-            rect=rect,
-            image_path=image_path,
-            debug_dir=debug_dir,
-        )
-
-    # Blur for color extraction, not for saving the visible ROI.
-    # This reduces the effect of grain micro-shadows.
-    roi_blur = cv2.GaussianBlur(roi_bgr, (9, 9), 0)
-
-    selected_pixels = roi_blur[mask_u8 > 0]
-
-    # If the mask becomes too restrictive, fall back to the full ROI.
-    if selected_pixels.shape[0] < 500:
-        selected_pixels = roi_blur.reshape(-1, 3)
-
-    lab_pixels = bgr_pixels_to_lab(selected_pixels)
-
-    lab_pixels = trim_lab_by_lightness(
-        lab_pixels,
+    """Compatibility wrapper for the historical batch pipeline."""
+    result = extract_color_features(
+        read_image_bgr(image_path, use_icc=True),
+        use_gray_calibration=use_gray_calibration,
+        downscale_max=downscale_max,
         trim_percent=trim_percent,
+        strict=False,
+        debug_dir=debug_dir if save_debug_masks else None,
+        gray_debug_dir="debug_gray" if save_debug_masks else None,
+        image_name=os.path.basename(image_path),
     )
-
-    lab_median = np.median(lab_pixels, axis=0)
-
-    if lab_median[0] > 75:
-        print(
-            f"  WARNING: very bright estimated soil color for {image_name}: "
-            f"L={lab_median[0]:.2f}. Check ROI/mask.",
-            flush=True,
-        )
-        
-    return tuple(float(x) for x in lab_median)
+    return result["lab"]
