@@ -1,0 +1,8 @@
+**
+!Dockerfile.service
+!requirements-service.txt
+!requirements-api.txt
+!src/
+!src/soil_color_orgc/
+!src/soil_color_orgc/**/*.py
+**/__pycache__/
