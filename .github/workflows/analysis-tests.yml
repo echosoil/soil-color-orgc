@@ -13,5 +13,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -r requirements-service.txt pytest
+      - run: python -m pip install -r requirements-api.txt pytest httpx
       - run: PYTHONPATH=src python -m pytest -q tests
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f Dockerfile.service -t soil-colour-api:ci .
+      - name: Smoke test isolated image with synthetic reference
+        run: |
+          set -e
+          ref="$RUNNER_TEMP/soil-colour-ci-reference.csv"
+          printf 'h,V,C,X_D65,Y_D65,Z_D65\n10YR,3,4,0.15,0.14,0.07\n' > "$ref"
+          chmod 644 "$ref"
+          docker run -d --name soil-colour-ci --read-only --tmpfs /tmp:size=64m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 2 --pids-limit 128 \
+            -p 127.0.0.1:8086:8080 \
+            -v "$ref:/reference/munsell.csv:ro" \
+            -e SOIL_COLOUR_REFERENCE=/reference/munsell.csv soil-colour-api:ci
+          trap 'docker logs soil-colour-ci; docker rm -f soil-colour-ci' EXIT
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8086/health; then exit 0; fi
+            sleep 2
+          done
+          exit 1
