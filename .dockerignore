@@ -5,4 +5,8 @@
 !src/
 !src/soil_color_orgc/
 !src/soil_color_orgc/**/*.py
+!src/soil_color_orgc/web/
+!src/soil_color_orgc/web/index.html
+!src/soil_color_orgc/web/soilvision.css
+!src/soil_color_orgc/web/soilvision.js
 **/__pycache__/

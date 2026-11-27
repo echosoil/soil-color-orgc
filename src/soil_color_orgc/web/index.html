@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SoilVision | ECHO Soil Colour Analysis</title>
+  <link rel="stylesheet" href="/assets/soilvision.css">
+  <script defer src="/assets/soilvision.js"></script>
+</head>
+<body>
+<header><div class="shell masthead"><a class="brand" href="/">Soil<span>Vision</span></a><span class="project">ECHO · Research preview</span><nav><a href="/docs">API documentation</a><a href="https://echosoil.eu">ECHO project</a></nav></div></header>
+<main class="shell">
+  <section class="intro"><p class="eyebrow">IMAGE-BASED SOIL CHARACTERIZATION</p><h1>Explore the colour of your soil.</h1><p>Extract CIE Lab colour features and compare them with a Munsell reference. Use a standardized soil photograph and select a representative region.</p></section>
+  <div class="layout">
+    <section class="panel" aria-labelledby="input-title">
+      <h2 id="input-title">1. Prepare the photograph</h2>
+      <label for="photo">Soil photograph</label>
+      <input id="photo" type="file" accept="image/jpeg,image/png,image/webp">
+      <p class="muted">JPEG, PNG or WebP · up to 8 MiB and 20 megapixels. Use only images you are authorized to upload.</p>
+      <div id="preview-area" hidden>
+        <p class="muted">Uncorrected, oriented preview. Drag a rectangle to select soil, avoiding labels, paper and the grey card.</p>
+        <div id="stage"><img id="preview" alt="Oriented soil photograph" draggable="false"><div id="roi-box" aria-hidden="true"></div><div id="used-box" aria-hidden="true" hidden></div></div>
+        <p class="legend"><span class="requested">Requested region</span><span class="used">Region actually used</span></p>
+        <fieldset><legend>Region of interest (normalized 0–1)</legend>
+          <div class="coords"><label>Left<input id="x0" type="number" min="0" max="1" step="0.001" value="0.4"></label><label>Top<input id="y0" type="number" min="0" max="1" step="0.001" value="0.5"></label><label>Right<input id="x1" type="number" min="0" max="1" step="0.001" value="0.6"></label><label>Bottom<input id="y1" type="number" min="0" max="1" step="0.001" value="0.7"></label></div>
+          <button type="button" class="secondary" id="reset">Reset central region</button>
+        </fieldset>
+      </div>
+      <label class="check"><input type="checkbox" id="gray"> Attempt eleven-patch grey-scale correction</label>
+      <p class="muted">Enable only when the expected black-to-white reference card is present near the bottom. A successful calculation does not verify physical calibration.</p>
+      <button type="button" id="analyze" disabled>Analyze photograph</button>
+      <p id="message" role="status" aria-live="polite">Choose a photograph to begin.</p>
+    </section>
+    <section class="panel" aria-labelledby="result-title">
+      <h2 id="result-title">2. Analysis results</h2>
+      <p id="placeholder" class="muted">Your colour measurements and quality diagnostics will appear here.</p>
+      <div id="results" hidden>
+        <p id="status" class="status" role="status"></p>
+        <div class="swatches"><div><canvas id="extracted" width="180" height="76" aria-label="Approximate extracted colour"></canvas><strong>Extracted colour</strong><p id="lab"></p></div><div><canvas id="matched" width="180" height="76" aria-label="Approximate Munsell reference colour"></canvas><strong>Munsell reference</strong><p id="munsell"></p></div></div>
+        <p id="swatch-note" class="muted"></p>
+        <dl id="metrics"></dl>
+        <h3>Quality warnings</h3><ul id="warnings"></ul>
+        <details><summary>Method and provenance</summary><pre id="provenance"></pre></details>
+        <div class="actions"><button type="button" id="json" class="secondary">Download JSON</button><button type="button" id="csv" class="secondary">Download CSV</button></div>
+      </div>
+      <aside><strong>Scientific scope</strong><p>This is an exploratory colour characterization tool, not a laboratory measurement or validated organic carbon prediction. Colour depends on lighting, moisture, camera and sample preparation.</p></aside>
+    </section>
+  </div>
+  <section class="privacy"><h2>Handling your image</h2><p>The preview and analysis send the original image to the server in separate requests. The application processes it in memory and does not persist uploaded photographs. This is a restricted research preview, not a public production service.</p></section>
+</main>
+<footer class="shell"><p>Developed within ECHO · Horizon Europe grant 101112869 · <a href="https://github.com/echosoil/soil-color-orgc">Source code</a></p></footer>
+</body>
+</html>
