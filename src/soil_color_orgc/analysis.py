@@ -39,10 +39,10 @@ class Reference:
         return (self.names[idx] if distance <= threshold else None), distance
 
 
-def analyze_image(image_bgr, reference, *, roi=None, gray=False, exploratory_carbon=False):
-    result = extract_color_features(image_bgr, roi=roi, use_gray_calibration=gray)
+def analyze_image(image_bgr, reference, *, roi=None, gray=False, gray_roi=None, exploratory_carbon=False):
+    result = extract_color_features(image_bgr, roi=roi, use_gray_calibration=gray, gray_roi=gray_roi)
     result.update({
-        "method_version": "soil-colour-v1-preview",
+        "method_version": "soil-colour-v2-preview",
         "reference_sha256": reference.sha256,
         "munsell": None, "delta_e_2000": None, "carbon_proxy": None,
     })

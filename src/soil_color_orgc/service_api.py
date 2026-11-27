@@ -12,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 from starlette.responses import FileResponse, JSONResponse, Response
 
-from .service_preview import preview_payload, colour_swatches
+from .service_preview import preview_payload, colour_swatches, gray_preview_payload
 
 from .analysis import Reference, analyze_image
 from .service_image import (
@@ -65,9 +65,9 @@ async def read_bounded_body(request):
     return bytes(body)
 
 
-def analyze_payload(body, media, reference, roi, gray):
+def analyze_payload(body, media, reference, roi, gray, gray_roi=None):
     image, decoding = decode_image(body, media)
-    result = analyze_image(image, reference, roi=roi, gray=gray)
+    result = analyze_image(image, reference, roi=roi, gray=gray, gray_roi=gray_roi)
     result["swatches"] = colour_swatches(result, reference)
     result["image_decoding"] = decoding
     result["scientific_status"] = "exploratory_colour_characterization_not_lab_measurement"
@@ -87,7 +87,7 @@ def create_app(reference_path=None):
 
     app = FastAPI(
         title="ECHO Soil Colour Analysis",
-        version="0.3.0",
+        version="0.3.1",
         description=(
             "Local-preview API for exploratory soil colour characterization. "
             "No validated carbon prediction, authentication or public deployment approval."
@@ -127,7 +127,7 @@ def create_app(reference_path=None):
     @app.get("/api/v1/models")
     def models(request: Request):
         return {
-            "method": "soil-colour-v1-preview",
+            "method": "soil-colour-v2-preview",
             "reference_sha256": request.app.state.reference.sha256,
             "carbon_prediction": "disabled",
             "limits": {
@@ -154,13 +154,17 @@ def create_app(reference_path=None):
     async def analyze(
         request: Request,
         gray: bool = Query(False, description="Request eleven-patch grey correction"),
+        gray_roi: str | None = Query(None, max_length=128, description="Exact manual grey strip, normalized x0,y0,x1,y1"),
         roi: str | None = Query(None, max_length=128, description=(
             "x0,y0,x1,y1 normalized coordinates after EXIF and portrait orientation"
         )),
     ):
         region = parse_roi(roi)
+        manual = parse_roi(gray_roi)
+        if manual is not None and not gray:
+            raise HTTPException(422, "gray_roi_requires_gray_true")
         return await process_upload(
-            request, analyze_payload, request.app.state.reference, region, gray
+            request, analyze_payload, request.app.state.reference, region, gray, manual
         )
 
     @app.post(
@@ -173,6 +177,12 @@ def create_app(reference_path=None):
     )
     async def preview(request: Request):
         return await process_upload(request, preview_payload)
+
+    @app.post("/api/v1/gray-preview", openapi_extra={"requestBody": {"required": True, "content": {
+        m: {"schema": {"type": "string", "format": "binary"}} for m in MEDIA_FORMATS
+    }}})
+    async def gray_preview(request: Request, gray_roi: str | None = Query(None, max_length=128)):
+        return await process_upload(request, gray_preview_payload, parse_roi(gray_roi))
 
     return app
 

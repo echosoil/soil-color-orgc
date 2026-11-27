@@ -5,6 +5,7 @@ from colour import Lab_to_XYZ, XYZ_to_sRGB
 
 from .image_processing import downscale_max_side, ensure_portrait_orientation
 from .service_image import decode_image
+from .gray_calibration import locate_gray_scale_roi
 
 
 def preview_payload(body, media):
@@ -31,3 +32,11 @@ def colour_swatches(result, reference):
     match = result["munsell"]
     matched = display_colour(reference.lab[reference.names.index(match)]) if match else None
     return {"extracted": measured, "munsell": matched, "space": "sRGB display approximation"}
+
+
+def gray_preview_payload(body, media, region=None):
+    image, _ = decode_image(body, media)
+    image = downscale_max_side(ensure_portrait_orientation(image), 800)
+    _, _, info = locate_gray_scale_roi(image, region)
+    h, w = image.shape[:2]
+    return {"image_width": w, "image_height": h, "gray_region": info}
