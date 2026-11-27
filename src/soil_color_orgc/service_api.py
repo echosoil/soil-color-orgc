@@ -10,7 +10,9 @@ import cv2
 from fastapi import FastAPI, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
+
+from .service_preview import preview_payload, colour_swatches
 
 from .analysis import Reference, analyze_image
 from .service_image import (
@@ -66,6 +68,7 @@ async def read_bounded_body(request):
 def analyze_payload(body, media, reference, roi, gray):
     image, decoding = decode_image(body, media)
     result = analyze_image(image, reference, roi=roi, gray=gray)
+    result["swatches"] = colour_swatches(result, reference)
     result["image_decoding"] = decoding
     result["scientific_status"] = "exploratory_colour_characterization_not_lab_measurement"
     return result
@@ -84,13 +87,38 @@ def create_app(reference_path=None):
 
     app = FastAPI(
         title="ECHO Soil Colour Analysis",
-        version="0.2.0",
+        version="0.3.0",
         description=(
             "Local-preview API for exploratory soil colour characterization. "
             "No validated carbon prediction, authentication or public deployment approval."
         ),
         lifespan=lifespan,
     )
+
+    web_dir = Path(__file__).with_name("web")
+    page_headers = {
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' blob:; connect-src 'self'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'"
+        ),
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(web_dir / "index.html", headers=page_headers)
+
+    @app.get("/assets/soilvision.css", include_in_schema=False)
+    def stylesheet():
+        return FileResponse(web_dir / "soilvision.css", media_type="text/css",
+                            headers={"X-Content-Type-Options": "nosniff"})
+
+    @app.get("/assets/soilvision.js", include_in_schema=False)
+    def javascript():
+        return FileResponse(web_dir / "soilvision.js", media_type="text/javascript",
+                            headers={"X-Content-Type-Options": "nosniff"})
 
     @app.get("/health")
     def health(request: Request):
@@ -131,30 +159,49 @@ def create_app(reference_path=None):
         )),
     ):
         region = parse_roi(roi)
-        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media not in MEDIA_FORMATS:
-            raise HTTPException(415, "unsupported_media_type")
-        if request.headers.get("content-encoding", "identity").strip().lower() != "identity":
-            raise HTTPException(415, "unsupported_content_encoding")
-        slots = request.app.state.slots
-        if not slots.acquire(blocking=False):
-            raise HTTPException(503, "analysis_busy", headers={"Retry-After": "2"})
-        try:
-            body = await read_bounded_body(request)
-            try:
-                result = await run_in_threadpool(
-                    analyze_payload, body, media, request.app.state.reference, region, gray
-                )
-            except ImageRejected as exc:
-                status = 413 if str(exc) in {"image_dimensions_exceeded", "icc_profile_too_large"} else 422
-                raise HTTPException(status, str(exc)) from exc
-            except (ValueError, cv2.error) as exc:
-                raise HTTPException(422, "image_analysis_failed") from exc
-            return JSONResponse(result, headers={"Cache-Control": "no-store"})
-        finally:
-            slots.release()
+        return await process_upload(
+            request, analyze_payload, request.app.state.reference, region, gray
+        )
+
+    @app.post(
+        "/api/v1/preview",
+        response_class=Response,
+        responses={200: {"content": {"image/png": {}}, "description": "Oriented uncorrected preview"}},
+        openapi_extra={"requestBody": {"required": True, "content": {
+            m: {"schema": {"type": "string", "format": "binary"}} for m in MEDIA_FORMATS
+        }}},
+    )
+    async def preview(request: Request):
+        return await process_upload(request, preview_payload)
 
     return app
+
+
+async def process_upload(request, processor, *args):
+    media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media not in MEDIA_FORMATS:
+        raise HTTPException(415, "unsupported_media_type")
+    if request.headers.get("content-encoding", "identity").strip().lower() != "identity":
+        raise HTTPException(415, "unsupported_content_encoding")
+    slots = request.app.state.slots
+    if not slots.acquire(blocking=False):
+        raise HTTPException(503, "analysis_busy", headers={"Retry-After": "2"})
+    try:
+        body = await read_bounded_body(request)
+        try:
+            result = await run_in_threadpool(processor, body, media, *args)
+        except ImageRejected as exc:
+            status = 413 if str(exc) in {"image_dimensions_exceeded", "icc_profile_too_large"} else 422
+            raise HTTPException(status, str(exc)) from exc
+        except (ValueError, cv2.error) as exc:
+            raise HTTPException(422, "image_analysis_failed") from exc
+        if isinstance(result, bytes):
+            return Response(result, media_type="image/png", headers={
+                "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+            })
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    finally:
+        slots.release()
 
 
 app = create_app()

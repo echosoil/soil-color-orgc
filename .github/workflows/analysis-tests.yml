@@ -33,7 +33,11 @@ jobs:
             -e SOIL_COLOUR_REFERENCE=/reference/munsell.csv soil-colour-api:ci
           trap 'docker logs soil-colour-ci; docker rm -f soil-colour-ci' EXIT
           for i in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:8086/health; then exit 0; fi
+            if curl -fsS http://127.0.0.1:8086/health; then
+              curl -fsS http://127.0.0.1:8086/ | grep -q SoilVision
+              curl -fsS http://127.0.0.1:8086/assets/soilvision.js >/dev/null
+              exit 0
+            fi
             sleep 2
           done
           exit 1
