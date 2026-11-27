@@ -720,7 +720,7 @@ def trim_gray_roi_vertically(
     return trimmed_roi, trimmed_rect
 
 
-def crop_gray_scale_roi(image_bgr):
+def locate_gray_scale_roi(image_bgr, manual_roi=None):
     """
     Main grey-scale ROI function.
 
@@ -729,6 +729,17 @@ def crop_gray_scale_roi(image_bgr):
     3. Trim horizontally to remove left/right margins.
     4. Fall back to fixed crop if detection fails.
     """
+    if manual_roi is not None:
+        h, w = image_bgr.shape[:2]
+        if len(manual_roi) != 4 or not all(np.isfinite(v) for v in manual_roi):
+            raise ValueError("Invalid manual grey region")
+        x0, y0, x1, y1 = manual_roi
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            raise ValueError("Invalid manual grey region")
+        rect = (round(w*x0), round(h*y0), round(w*x1), round(h*y1))
+        crop = image_bgr[rect[1]:rect[3], rect[0]:rect[2]].copy()
+        return crop, rect, gray_region_info(crop, rect, "manual")
+
     detected_roi, detected_rect, diag = detect_gray_scale_by_gray_ramp(
         image_bgr,
         x_min=0.05,
@@ -750,7 +761,7 @@ def crop_gray_scale_roi(image_bgr):
             n_patches=11,
         )
 
-        return detected_roi, detected_rect
+        return detected_roi, detected_rect, gray_region_info(detected_roi, detected_rect, "automatic")
 
     fallback_roi, fallback_rect = crop_fixed_gray_scale_roi(
         image_bgr,
@@ -771,8 +782,34 @@ def crop_gray_scale_roi(image_bgr):
         n_patches=11,
     )
 
-    return fallback_roi, fallback_rect
-    
+    return fallback_roi, fallback_rect, gray_region_info(fallback_roi, fallback_rect, "fixed_fallback")
+
+
+def gray_region_info(crop, rect, source):
+    score, diag = score_gray_ramp_candidate(crop)
+    # Evaluate the final, actually sampled region, not the broader search band.
+    passes = bool(score >= 80 and diag.get("corr", 0) >= .65
+                  and diag.get("contrast", 0) >= 45
+                  and diag.get("negative_steps", 99) <= 3)
+    x, y, _, _ = rect
+    patches = []
+    if crop.size:
+        for p in split_gray_patches(crop):
+            patches.append([int(x+p["cx1"]), int(y+p["cy1"]),
+                            int(x+p["cx2"]), int(y+p["cy2"])])
+    return {"source": source, "rect": [int(v) for v in rect],
+            "search_rect": None if source == "manual" else
+                [0.05, 0.76, 0.90, 0.96],
+            "ramp_diagnostics": diag, "ramp_pass": passes,
+            "usable": passes and source != "fixed_fallback",
+            "patch_rects": patches}
+
+
+def crop_gray_scale_roi(image_bgr):
+    """Historical two-value interface including the fixed fallback."""
+    crop, rect, _ = locate_gray_scale_roi(image_bgr)
+    return crop, rect
+
 
 def split_gray_patches(gray_roi_bgr, n_patches=11):
     """
@@ -906,6 +943,7 @@ def correct_image_using_gray_scale(
     n_patches=11,
     debug_dir=None,
     image_name=None,
+    selection=None,
 ):
     """
     Correct colour balance using the grey scale at the bottom of the image.
@@ -916,7 +954,10 @@ def correct_image_using_gray_scale(
     Returns:
         corrected_bgr, report_df
     """
-    gray_roi_bgr, rect = crop_gray_scale_roi(image_bgr)
+    if selection is None:
+        gray_roi_bgr, rect = crop_gray_scale_roi(image_bgr)
+    else:
+        gray_roi_bgr, rect = selection[:2]
 
     if gray_roi_bgr.size == 0:
         raise ValueError("Empty grey-scale ROI")

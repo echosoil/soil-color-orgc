@@ -1,12 +1,14 @@
 "use strict";
 const el = id => document.getElementById(id);
 const coords = ["x0","y0","x1","y1"].map(el);
+const grayCoords = ["gx0","gy0","gx1","gy1"].map(el);
+let grayInfo=null;
 const defaultROI = [0.4,0.5,0.6,0.7];
 const mediaTypes = ["image/jpeg","image/png","image/webp"];
 let photo = null, previewURL = null, generation = 0, ready = false, busy = false, result = null, drag = null;
 function say(text) { el("message").textContent = text; }
-function roi() {
-  const values = coords.map(input => input.valueAsNumber);
+function roi(inputs=coords) {
+  const values = inputs.map(input => input.valueAsNumber);
   const [x0,y0,x1,y1] = values;
   return values.every(Number.isFinite) && x0>=0 && y0>=0 && x1<=1 && y1<=1 && x0<x1 && y0<y1 ? values : null;
 }
@@ -17,7 +19,47 @@ function drawBox(box, r) {
   box.style.left=(100*x0)+"%"; box.style.top=(100*y0)+"%";
   box.style.width=(100*(x1-x0))+"%"; box.style.height=(100*(y1-y0))+"%";
 }
-function sync() { drawBox(el("roi-box"),roi()); el("analyze").disabled=!ready||busy||!roi(); }
+function sync() {
+  drawBox(el("roi-box"),roi());
+  el("analyze").disabled=!ready||busy||!roi()||(el("gray").checked&&el("manual-gray").checked&&!roi(grayCoords));
+  el("detect-gray").disabled=!ready||busy;
+  el("check-gray").disabled=!ready||busy||!el("manual-gray").checked||!roi(grayCoords);
+  grayCoords.forEach(i=>i.disabled=busy||!el("manual-gray").checked);
+}
+function normalized(rect,w,h){return [rect[0]/w,rect[1]/h,rect[2]/w,rect[3]/h];}
+function showGray(info,w,h){
+  grayInfo=info;el("gray-patches").replaceChildren();
+  if(!info){drawBox(el("gray-box"),null);return;}
+  const region=normalized(info.rect,w,h);
+  drawBox(el("gray-box"),region);
+  if(!el("manual-gray").checked)grayCoords.forEach((input,i)=>input.value=Number(region[i].toFixed(6)));
+  for(const rect of info.patch_rects||[]){
+    const box=document.createElement("div");box.className="gray-patch";el("gray-patches").append(box);
+    drawBox(box,normalized(rect,w,h));
+  }
+  const d=info.ramp_diagnostics||{};
+  el("gray-info").textContent=info.source.replaceAll("_"," ")+": "+(info.usable?"ramp accepted for correction":"not accepted; inspect or select manually")+(Number.isFinite(d.corr)?" · correlation "+d.corr.toFixed(3)+" · contrast "+d.contrast.toFixed(1):"");
+}
+function editGray(){
+  grayInfo=null;el("gray-patches").replaceChildren();drawBox(el("gray-box"),roi(grayCoords));
+  el("gray-info").textContent="Manual strip not checked. Click Check manual strip or analyze with grey correction enabled.";
+  invalidate();sync();
+}
+async function inspectGray(manual){
+  if(!ready||busy)return;
+  const region=manual?roi(grayCoords):null;if(manual&&!region)return;
+  const id=generation;
+  if(!manual)el("manual-gray").checked=false;
+  busy=true;disableControls(true);invalidate();sync();say("Inspecting grey reference…");
+  try{
+    const suffix=manual?"?"+new URLSearchParams({gray_roi:region.join(",")}):"";
+    const response=await post("/api/v1/gray-preview"+suffix,photo);
+    const r=await response.json();if(id!==generation)return;
+    showGray(r.gray_region,r.image_width,r.image_height);
+    say("Grey region inspection finished. Review the overlay before analysis.");
+  }catch(error){if(id===generation){showGray(null);el("gray-info").textContent="Grey inspection failed.";say(error.message);}}
+  finally{if(id===generation){busy=false;disableControls(false);sync();}}
+}
 function invalidate() { result=null; el("results").hidden=true; el("placeholder").hidden=false; el("used-box").hidden=true; }
 function setROI(r) { coords.forEach((input,i)=>input.value=Number(r[i].toFixed(3))); invalidate(); sync(); }
 function revokePreview() { if(previewURL) URL.revokeObjectURL(previewURL); previewURL=null; el("preview").removeAttribute("src"); }
@@ -31,7 +73,7 @@ async function post(path, file) {
   return response;
 }
 el("photo").addEventListener("change",async()=>{
-  const id=++generation; photo=null; ready=false; busy=false; invalidate(); revokePreview();
+  const id=++generation; photo=null; ready=false; busy=false; drag=null; invalidate(); revokePreview(); showGray(null); el("manual-gray").checked=false; grayCoords.forEach(i=>i.value=""); el("gray-info").textContent="Use Detect automatically to inspect the suggested strip.";
   el("preview-area").hidden=true; sync();
   const file=el("photo").files[0];
   if(!file){say("Choose a photograph to begin.");return;}
@@ -49,23 +91,30 @@ el("photo").addEventListener("change",async()=>{
   } catch(error){ if(id===generation){ready=false;revokePreview();say(error.message);sync();} }
 });
 coords.forEach(input=>input.addEventListener("input",()=>{invalidate();sync();}));
-el("gray").addEventListener("change",invalidate);
+el("gray").addEventListener("change",()=>{invalidate();sync();});
+el("manual-gray").addEventListener("change",()=>{
+  if(el("manual-gray").checked)editGray();else{showGray(null);el("gray-info").textContent="Click Detect automatically to inspect the strip.";invalidate();sync();}
+});
+grayCoords.forEach(input=>input.addEventListener("input",editGray));
+el("detect-gray").addEventListener("click",()=>inspectGray(false));
+el("check-gray").addEventListener("click",()=>inspectGray(true));
 el("reset").addEventListener("click",()=>setROI(defaultROI));
 function point(event){const rect=el("stage").getBoundingClientRect();return [Math.max(0,Math.min(1,(event.clientX-rect.left)/rect.width)),Math.max(0,Math.min(1,(event.clientY-rect.top)/rect.height))];}
 el("stage").addEventListener("pointerdown",event=>{
   if(!ready||busy||!event.isPrimary||event.button!==0)return;
-  drag={start:point(event),id:event.pointerId}; el("stage").setPointerCapture(event.pointerId);
+  drag={start:point(event),id:event.pointerId,gray:el("manual-gray").checked}; el("stage").setPointerCapture(event.pointerId);
 });
 function updateDrag(event){
   if(!drag||drag.id!==event.pointerId)return;
   const [x,y]=point(event),[a,b]=drag.start;
   if(Math.abs(x-a)<.005||Math.abs(y-b)<.005)return;
-  setROI([Math.min(x,a),Math.min(y,b),Math.max(x,a),Math.max(y,b)]);
+  const r=[Math.min(x,a),Math.min(y,b),Math.max(x,a),Math.max(y,b)];
+  if(drag.gray){grayCoords.forEach((input,i)=>input.value=Number(r[i].toFixed(4)));editGray();}else setROI(r);
 }
 el("stage").addEventListener("pointermove",updateDrag);
 el("stage").addEventListener("pointerup",event=>{updateDrag(event);drag=null;});
 el("stage").addEventListener("pointercancel",()=>{drag=null;});
-function disableControls(disabled){coords.forEach(input=>input.disabled=disabled);el("gray").disabled=disabled;el("reset").disabled=disabled;}
+function disableControls(disabled){coords.forEach(input=>input.disabled=disabled);el("gray").disabled=disabled;el("reset").disabled=disabled;el("manual-gray").disabled=disabled;grayCoords.forEach(input=>input.disabled=disabled||!el("manual-gray").checked);}
 function swatch(id,value){const canvas=el(id),ctx=canvas.getContext("2d");ctx.clearRect(0,0,canvas.width,canvas.height);if(value&&/^#[0-9a-f]{6}$/i.test(value.hex)){ctx.fillStyle=value.hex;ctx.fillRect(0,0,canvas.width,canvas.height);}}
 function metric(name,value){const row=document.createElement("div"),dt=document.createElement("dt"),dd=document.createElement("dd");dt.textContent=name;dd.textContent=value;row.append(dt,dd);el("metrics").append(row);}
 function render(r){
@@ -81,12 +130,14 @@ function render(r){
   metric("Selected fraction",(100*r.selected_fraction).toFixed(2)+"%");
   metric("Grey correction",r.gray_calibration.replaceAll("_"," "));
   if(r.gray_metrics){metric("Mean grey imbalance before",r.gray_metrics.mean_imbalance_before.toFixed(2));metric("Mean grey imbalance after",r.gray_metrics.mean_imbalance_after.toFixed(2));}
+  if(r.gray_region){showGray(r.gray_region,r.image_width,r.image_height);metric("Grey region source",r.gray_region.source.replaceAll("_"," "));}
+  el("gray-details").hidden=!r.gray_region?.patch_measurements;el("gray-report").textContent=(r.gray_region?.patch_measurements||[]).map(p=>p.scale_label+": "+[p.measured_R,p.measured_G,p.measured_B].map(v=>v.toFixed(1)).join(" / ")+" → "+[p.after_R,p.after_G,p.after_B].map(v=>v.toFixed(1)).join(" / ")+" (target "+p.target_gray.toFixed(1)+")").join("\n");
   metric("ICC handling",r.image_decoding.icc_status.replaceAll("_"," "));
   metric("Carbon prediction","Disabled");
   el("warnings").replaceChildren();
-  const labels={gray_calibration_failed:"Grey correction failed; uncorrected image used.",gray_imbalance_not_improved:"Grey imbalance did not improve.",insufficient_soil_pixels:"Insufficient selected soil pixels.",high_lightness_check_roi:"High lightness; check the selected region.",no_close_munsell_match:"No reference colour within the matching threshold."};
+  const labels={gray_calibration_failed:"Grey correction failed; uncorrected image used.",gray_region_not_accepted:"Grey region was not accepted; check all 11 patches and select manually if appropriate.",gray_imbalance_not_improved:"Grey imbalance did not improve.",insufficient_soil_pixels:"Insufficient selected soil pixels.",high_lightness_check_roi:"High lightness; check the selected region.",no_close_munsell_match:"No reference colour within the matching threshold."};
   (r.warnings.length?r.warnings:["none"]).forEach(w=>{const li=document.createElement("li");li.textContent=w==="none"?"No algorithm warnings. This does not establish measurement validity.":labels[w]||w;el("warnings").append(li);});
-  el("provenance").textContent=JSON.stringify({method:r.method_version,reference_sha256:r.reference_sha256,requested_roi:r.requested_roi,gray_requested:r.gray_requested,image_decoding:r.image_decoding,scientific_status:r.scientific_status},null,2);
+  el("provenance").textContent=JSON.stringify({method:r.method_version,reference_sha256:r.reference_sha256,requested_roi:r.requested_roi,gray_requested:r.gray_requested,gray_region:r.gray_region,image_decoding:r.image_decoding,scientific_status:r.scientific_status},null,2);
   const [x0,y0,x1,y1]=r.roi_pixels;
   if(r.image_width===el("preview").naturalWidth&&r.image_height===el("preview").naturalHeight)drawBox(el("used-box"),[x0/r.image_width,y0/r.image_height,x1/r.image_width,y1/r.image_height]);
 }
@@ -95,7 +146,9 @@ el("analyze").addEventListener("click",async()=>{
   const id=generation,file=photo,gray=el("gray").checked;
   busy=true;disableControls(true);invalidate();sync();say("Analyzing photograph…");
   try{
-    const response=await post("/api/v1/analyze?"+new URLSearchParams({roi:region.join(","),gray:String(gray)}),file);
+    const params=new URLSearchParams({roi:region.join(","),gray:String(gray)});
+    if(gray&&el("manual-gray").checked)params.set("gray_roi",roi(grayCoords).join(","));
+    const response=await post("/api/v1/analyze?"+params,file);
     const r=await response.json();
     if(id!==generation)return;
     r.requested_roi=region;r.gray_requested=gray;render(r);say("Analysis finished.");

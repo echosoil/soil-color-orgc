@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 from colour import sRGB_to_XYZ, XYZ_to_Lab
-from .gray_calibration import correct_image_using_gray_scale
+from .gray_calibration import correct_image_using_gray_scale, locate_gray_scale_roi
 from .image_io import read_image_bgr
 
 def ensure_portrait_orientation(image_bgr):
@@ -286,6 +286,7 @@ def extract_color_features(
     *,
     roi=None,
     use_gray_calibration=False,
+    gray_roi=None,
     downscale_max=800,
     trim_percent=0.05,
     strict=True,
@@ -316,10 +317,21 @@ def extract_color_features(
     warnings = []
     calibration = "not_requested"
     calibration_metrics = None
+    gray_region = None
+    if gray_roi is not None and not use_gray_calibration:
+        raise ValueError("Manual grey region requires grey correction")
     if use_gray_calibration:
         try:
+            selection = None
+            if strict or gray_roi is not None:
+                selection = locate_gray_scale_roi(image_bgr, gray_roi)
+                gray_region = selection[2]
+                if not gray_region["usable"]:
+                    warnings.append("gray_region_not_accepted")
+                    raise ValueError("Grey region did not pass the ramp check")
             corrected, report = correct_image_using_gray_scale(
-                image_bgr, n_patches=11, debug_dir=gray_debug_dir, image_name=image_name
+                image_bgr, n_patches=11, debug_dir=gray_debug_dir, image_name=image_name,
+                selection=selection,
             )
             if len(report) != 11 or not np.isfinite(
                 report[["imbalance_before", "imbalance_after"]].to_numpy()
@@ -329,6 +341,14 @@ def extract_color_features(
                 "mean_imbalance_before": float(report["imbalance_before"].mean()),
                 "mean_imbalance_after": float(report["imbalance_after"].mean()),
             }
+            if gray_region is not None:
+                gray_region["patch_measurements"] = [
+                    {k: float(row[k]) for k in (
+                        "measured_R", "measured_G", "measured_B", "after_R",
+                        "after_G", "after_B", "target_gray", "imbalance_before", "imbalance_after"
+                    )} | {"scale_label": int(row["scale_label"])}
+                    for _, row in report.iterrows()
+                ]
             image_bgr = corrected
             calibration = "applied"
             if calibration_metrics["mean_imbalance_after"] >= calibration_metrics["mean_imbalance_before"]:
@@ -357,6 +377,7 @@ def extract_color_features(
         "roi_pixels": list(rect), "selected_pixels": count,
         "roi_pixel_count": total, "selected_fraction": count / total,
         "gray_calibration": calibration, "gray_metrics": calibration_metrics,
+        "gray_region": gray_region,
         "warnings": warnings, "used_full_roi_fallback": False,
     }
     if count < 500 or (strict and count / total < 0.10):
